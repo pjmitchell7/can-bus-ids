@@ -1,0 +1,5 @@
+git_status.txt
+git_tracked.txt
+git_untracked.txt
+sizes.txt
+skeleton.txt

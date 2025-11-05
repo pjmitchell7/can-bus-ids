@@ -1,0 +1,14 @@
+512	./.git/branches
+1.0K	./src
+1.0K	./tools
+2.0K	./experiments/src
+2.5K	./data/raw
+3.0K	./experiments
+3.5K	./data
+3.5K	./.git/refs
+5.0K	./.git/info
+16K	./.git/logs
+39K	./.git/objects
+67K	./.git/hooks
+154K	./.git
+190K	.
