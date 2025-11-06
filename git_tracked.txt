@@ -1,9 +1,0 @@
-README.md
-data/.gitkeep
-data/raw/.gitkeep
-data/raw/processed/interim/.gitkeep
-experiments/.gitkeep
-experiments/src/.gitkeep
-experiments/src/tools/.gitkeep
-src/.gitkeep
-tools/.gitkeep
