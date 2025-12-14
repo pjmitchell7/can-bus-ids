@@ -1,295 +1,237 @@
-# I load raw CSVs, normalize features (fit on train only), pool into fixed-time windows,
-# and write compact .npz arrays to data/processed for training/eval.
-
-import os, sys, json, argparse, re
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import os
+import argparse
+from dataclasses import dataclass, field
+from typing import List, Optional
+import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+import torch
 
-# I ensure local imports resolve when running as a script.
-sys.path.append(os.path.dirname(__file__))
+# ---- Config -----------------------------------------------------------------
 
-from config import Config
-from utils import parse_payload
+@dataclass
+class Config:
+    # Raw CSVs
+    train_csv: str = "data/raw/train_normal.csv"
+    val_csv:   str = "data/raw/val_mix.csv"
+    test_csv:  str = "data/raw/test_mix.csv"
 
-# I map common HCRL-style headers to my canonical names.
-_CAN_ALIASES = {
-    "timestamp": ["Timestamp", "TimeStamp", "timeStamp", "timestamp", "Time", "time", "t", "ts", "Timestamp[ms]"],
-    "can_id": ["CAN_ID", "CAN ID", "Arbitration_ID", "Arbitration ID", "can_id", "ID", "id"],
-    "dlc": ["DLC", "dlc", "len", "Length"],
-    "payload_str": ["payload", "Payload", "DATA", "data", "bytes", "BYTES", "frame", "Frame", "DataBytes"],
-}
+    # Expected columns
+    ts_col: str = "Timestamp"
+    id_col: str = "CAN_ID"
+    dlc_col: str = "DLC"
+    payload_cols: List[str] = field(default_factory=lambda: [
+        "DATA0","DATA1","DATA2","DATA3","DATA4","DATA5","DATA6","DATA7"
+    ])
 
-def _norm_map(cols):
-    # I build a case-insensitive lookup map for existing columns.
-    return {c.lower(): c for c in cols}
+    # Windowing
+    window_len: int = 64   # frames per window
+    hop:        int = 32   # stride
 
-def _pick_col(df: pd.DataFrame, preferred: str, alts: list[str]):
-    # I locate a column by preferred name or any alias (case-insensitive).
-    lower = _norm_map(df.columns)
-    if preferred.lower() in lower:
-        return lower[preferred.lower()]
-    for a in alts:
-        if a.lower() in lower:
-            return lower[a.lower()]
-    raise KeyError
+    # Runtime
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-def _guess_time_col(df: pd.DataFrame):
-    # I first try known aliases; if that fails, I guess by name and numeric monotonicity.
-    try:
-        return _pick_col(df, "Timestamp", _CAN_ALIASES["timestamp"])
-    except KeyError:
-        pass
-    candidates = []
-    for c in df.columns:
-        if re.search(r"time|stamp|epoch", c, re.IGNORECASE):
-            s = pd.to_numeric(df[c], errors="coerce")
-            ok = s.notna().mean()
-            if ok >= 0.8:
-                rng = float(s.max() - s.min())
-                candidates.append((ok, rng, c))
-    if candidates:
-        candidates.sort(reverse=True)
-        return candidates[0][2]
-    scores = []
-    for c in df.columns:
-        s = pd.to_numeric(df[c], errors="coerce")
-        ok = s.notna().mean()
-        rng = float((s.max() - s.min()) if ok > 0 else 0.0)
-        scores.append((ok, rng, c))
-    scores.sort(reverse=True)
-    if scores and scores[0][0] >= 0.8:
-        return scores[0][2]
-    raise KeyError("I couldn't infer a timestamp column automatically.")
+    # Output
+    out_dir: str = "data/processed"
 
-def _guess_can_id_col(df: pd.DataFrame):
-    # I try aliases first, then guess by hex-like coverage.
-    try:
-        return _pick_col(df, "CAN_ID", _CAN_ALIASES["can_id"])
-    except KeyError:
-        pass
-    best = None
-    best_cov = -1.0
-    for c in df.columns:
-        s = df[c].astype(str).str.strip()
-        cov = s.str.match(r"^[0-9A-Fa-f]{2,8}$").mean()
-        if cov > best_cov:
-            best_cov = cov
-            best = c
-    if best is not None and best_cov >= 0.5:
-        return best
-    raise KeyError("I couldn't infer the CAN ID column automatically.")
+# ---- Utilities ---------------------------------------------------------------
 
-def _find_payload_by_regex(df: pd.DataFrame):
-    # I try to detect 8 per-byte columns via flexible regex:
-    # Accept DATA0, data_0, DATA[0], Byte0, B0, etc., case-insensitive.
-    name_map = {}
-    for c in df.columns:
-        m = re.match(r"^\s*(?:data|byte|b)\s*[\[\(_\-\s]*([0-7])[\]\)_\-\s]*\s*$", str(c), re.IGNORECASE)
-        if m:
-            idx = int(m.group(1))
-            name_map[idx] = c
-    if len(name_map) == 8:
-        return [name_map[i] for i in range(8)]
-    # Fallback: pick any 8 columns whose values look like hex bytes with high coverage.
-    scores = []
-    for c in df.columns:
-        s = df[c].astype(str).str.strip()
-        cov_hex = s.str.match(r"^[0-9A-Fa-f]{1,2}$").mean()
-        cov_dec = pd.to_numeric(s, errors="coerce").between(0, 255).mean()
-        score = max(cov_hex, cov_dec)
-        scores.append((score, c))
-    scores.sort(reverse=True)
-    top = [c for sc, c in scores[:8] if sc >= 0.7]
-    if len(top) == 8:
-        # I preserve original order if they look like a contiguous block near the end.
-        return top
-    return None
+def _ensure_outdir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
-def _infer_payload_cols(df: pd.DataFrame, cfg: Config):
-    # I choose payload columns in this priority:
-    # 1) Config payload_cols (case-insensitive) if present.
-    # 2) DATA0..DATA7 (any case).
-    # 3) DATA[0]..DATA[7] (any case).
-    # 4) Regex-based detection for Byte0..Byte7 variants.
-    # 5) Single payload string column.
-    if cfg.payload_cols:
-        cols = []
-        lower = _norm_map(df.columns)
-        ok = True
-        for name in cfg.payload_cols:
-            if name.lower() in lower:
-                cols.append(lower[name.lower()])
-            else:
-                ok = False
-                break
-        if ok and cols:
-            return cols, None
-    names = [f"DATA{i}" for i in range(8)]
-    lower = _norm_map(df.columns)
-    if all(n.lower() in lower for n in names):
-        return [lower[n.lower()] for n in names], None
-    bracket = [f"DATA[{i}]" for i in range(8)]
-    if all(b.lower() in lower for b in bracket):
-        return [lower[b.lower()] for b in bracket], None
-    by_regex = _find_payload_by_regex(df)
-    if by_regex:
-        return by_regex, None
-    for cand in _CAN_ALIASES["payload_str"]:
-        if cand in df.columns:
-            return None, cand
-        if cand.lower() in lower:
-            return None, lower[cand.lower()]
-    raise KeyError("I couldn't find payload bytes (DATA0..7 / DATA[0]..[7] / Byte0..7 / payload string).")
+def _hex_lookup_table() -> np.ndarray:
+    # Map b"00".."ff" to 0..255 for vectorized hex decode
+    lut = np.full((256, 256), -1, dtype=np.int16)
+    hexd = b"0123456789abcdefABCDEF"
+    for hi in range(256):
+        for lo in range(256):
+            s = bytes([hi, lo])
+            if s[0] in hexd and s[1] in hexd:
+                try:
+                    lut[hi, lo] = int(s.decode("ascii"), 16)
+                except Exception:
+                    pass
+    return lut
 
-def _hex_to_int_series(s: pd.Series) -> pd.Series:
-    # I convert a hex-like string column (e.g., 'fe', '0A', '00') to integers 0..255.
-    def conv(x):
-        if pd.isna(x):
-            return 0
-        v = str(x).strip().replace("0x","").replace("0X","")
-        if v == "":
-            return 0
-        try:
-            return int(v, 16)
-        except Exception:
-            try:
-                return int(float(v))
-            except Exception:
-                return 0
-    return s.apply(conv).clip(lower=0, upper=255).astype("int16")
+_LUT = _hex_lookup_table()
 
-def _coerce_payload_block(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
-    # I coerce each payload column to numeric bytes even if stored as hex, then stack as (N, 8).
-    arrays = []
-    for c in cols:
-        s = df[c]
-        if pd.api.types.is_numeric_dtype(s):
-            arr = s.to_numpy(dtype=np.float32, copy=False)
-        else:
-            arr = _hex_to_int_series(s).to_numpy(dtype=np.float32, copy=False)
-        arrays.append(arr)
-    return np.column_stack(arrays).astype(np.float32)
+def _hex_series_to_uint8(series: pd.Series) -> np.ndarray:
+    # Convert series of strings like "fe","0a" to uint8
+    s = series.astype("string").fillna("00").str.strip().str.slice(0, 2).astype("string")
+    arr = s.to_numpy(dtype=object)
+    first  = np.frombuffer("".join([x[0] if len(x) > 0 else "0" for x in arr]).encode("ascii"), dtype=np.uint8)
+    second = np.frombuffer("".join([x[1] if len(x) > 1 else "0" for x in arr]).encode("ascii"), dtype=np.uint8)
+    out = _LUT[first, second].astype(np.int16)
+    out[out < 0] = 0
+    return out.astype(np.uint8)
 
-def _load_table(path: str, cfg: Config, max_rows: int | None):
-    # I read with low_memory=False to avoid mixed-type chunk inference issues on huge files.
-    df = pd.read_csv(path, nrows=max_rows, low_memory=False)
+def _read_can_csv(path: str, cfg: Config, max_rows: Optional[int]) -> pd.DataFrame:
+    # Build desired usecols, then intersect with actual header so I can optionally pull label
+    header_cols = pd.read_csv(path, nrows=0).columns.tolist()
+    desired = [cfg.ts_col, cfg.id_col, cfg.dlc_col] + cfg.payload_cols
+    if "label" in header_cols:
+        desired += ["label"]
+    usecols = [c for c in desired if c in header_cols]
 
-    # I find the timestamp column robustly.
-    ts_col = _guess_time_col(df)
+    dtypes = {
+        cfg.ts_col:  "float64",
+        cfg.id_col:  "string",
+        cfg.dlc_col: "int16",
+        **{c: "string" for c in cfg.payload_cols},
+    }
+    if "label" in usecols:
+        dtypes["label"] = "int8"
 
-    # I find the CAN ID column robustly.
-    id_col = _guess_can_id_col(df)
+    df = pd.read_csv(
+        path,
+        usecols=usecols,
+        dtype=dtypes,
+        nrows=max_rows,
+        engine="c",
+        low_memory=False,
+    )
 
-    # I find payload bytes.
-    payload_cols, payload_str_col = _infer_payload_cols(df, cfg)
+    # Normalize CAN_ID to lowercase hex without 0x
+    if cfg.id_col in df.columns:
+        df[cfg.id_col] = df[cfg.id_col].astype("string").str.lower().str.replace("0x", "", regex=False)
 
-    if payload_cols is not None:
-        # I remap bracketed names to flat names if needed and coerce hex to ints.
-        if payload_cols and "[" in str(payload_cols[0]):
-            flat = [f"DATA{i}" for i in range(8)]
-            for src, dst in zip(payload_cols, flat):
-                if dst not in df.columns:
-                    df[dst] = df[src]
-            payload_cols = flat
-        pbytes = _coerce_payload_block(df, payload_cols)
+    # Clip DLC to [0,8]
+    if cfg.dlc_col in df.columns:
+        df[cfg.dlc_col] = pd.to_numeric(df[cfg.dlc_col], errors="coerce").fillna(0).clip(0, 8).astype(np.int16)
+
+    return df
+
+def _extract_payload_uint8(df: pd.DataFrame, cfg: Config) -> np.ndarray:
+    cols = []
+    for c in cfg.payload_cols:
+        cols.append(_hex_series_to_uint8(df[c]) if c in df.columns else np.zeros(len(df), dtype=np.uint8))
+    return np.stack(cols, axis=1)  # (N, 8)
+
+def _encode_can_id(df: pd.DataFrame, cfg: Config, id_to_code: dict[str, int] | None) -> np.ndarray:
+    if cfg.id_col not in df.columns:
+        return np.zeros(len(df), dtype=np.int32)
+
+    s = df[cfg.id_col].astype("string").fillna("").str.lower().str.replace("0x", "", regex=False)
+
+    if id_to_code is None:
+        # Fallback, but we should not use this in the final pipeline anymore
+        codes, _ = pd.factorize(s)
+        return codes.astype(np.int32)
+
+    # Map using the shared vocabulary; unknown IDs become -1
+    mapped = s.map(lambda x: id_to_code.get(str(x), -1)).to_numpy(dtype=np.int32, copy=False)
+    return mapped
+
+def _build_feature_matrix(df: pd.DataFrame, cfg: Config, id_to_code: dict[str, int] | None) -> np.ndarray:
+    p = _extract_payload_uint8(df, cfg).astype(np.float32)
+    dlc = (df[cfg.dlc_col].to_numpy(dtype=np.float32, copy=False).reshape(-1, 1)) if cfg.dlc_col in df.columns else np.zeros((len(df), 1), dtype=np.float32)
+    cid = _encode_can_id(df, cfg, id_to_code).astype(np.float32).reshape(-1, 1)
+    X = np.concatenate([p, dlc, cid], axis=1)
+    return X
+
+def _windows_torch(X_np: np.ndarray, win: int, hop: int, device: str) -> np.ndarray:
+    """
+    Slide along time axis producing (M, win, F)
+    X_np: (N, F)
+    """
+    N, F = X_np.shape
+    if N < win:
+        raise ValueError(f"not enough rows ({N}) for window_len={win}")
+
+    t = torch.from_numpy(X_np)  # (N, F)
+    if device == "cuda":
+        t = t.to("cuda", non_blocking=True)
+
+    # Unfold along N after transpose to (F, N)
+    u = t.transpose(0, 1).unfold(dimension=1, size=win, step=hop).contiguous()  # (F, M, win)
+    out = u.permute(1, 2, 0).contiguous()  # (M, win, F)
+    return out.detach().cpu().numpy()
+
+def _derive_window_labels(df: pd.DataFrame, win: int, hop: int) -> Optional[np.ndarray]:
+    if "label" not in df.columns:
+        return None
+    lab = pd.to_numeric(df["label"], errors="coerce").fillna(0).astype(int).to_numpy()
+    N = len(lab)
+    if N < win:
+        return None
+    M = 1 + max(0, (N - win) // hop)
+    y = np.zeros(M, dtype=np.int32)
+    start = 0
+    for i in range(M):
+        y[i] = int(np.any(lab[start:start + win] == 1))
+        start += hop
+    return y
+
+def _process_one(path: str, cfg: Config, max_rows: Optional[int], out_name: str, id_to_code: dict[str, int] | None) -> tuple[str, Optional[np.ndarray]]:
+    df = _read_can_csv(path, cfg, max_rows)
+    X = _build_feature_matrix(df, cfg, id_to_code)                          # (N, F)
+    W = _windows_torch(X, cfg.window_len, cfg.hop, cfg.device)              # (M, win, F)
+    y_win = _derive_window_labels(df, cfg.window_len, cfg.hop)
+
+    _ensure_outdir(cfg.out_dir)
+    out_path = os.path.join(cfg.out_dir, out_name)
+    if y_win is not None:
+        np.savez_compressed(out_path, X=W.astype(np.float32), y=y_win.astype(np.int32))
     else:
-        # I parse the single payload string column into 8 bytes.
-        pbytes = np.stack(df[payload_str_col].apply(parse_payload).values).astype(np.float32)
+        np.savez_compressed(out_path, X=W.astype(np.float32))
 
-    # I build time and inter-arrival features.
-    t = pd.to_numeric(df[ts_col], errors="coerce").ffill().bfill().astype(float).to_numpy()
-    dt = np.diff(t, prepend=t[0])
-    dt = np.clip(dt, 0.0, 0.5).astype("float32").reshape(-1, 1)
+    print(f"Saved: {out_path}  windows={W.shape[0]}  win_len={W.shape[1]}  feat_dim={W.shape[2]}")
+    return out_path, y_win
 
-    # I normalize CAN IDs to strings (keep hex as-is).
-    ids_str = df[id_col].astype(str).to_numpy()
+def _save_can_id_map(path: str, id_to_code: dict[str, int]) -> None:
+    with open(path, "w") as f:
+        json.dump(id_to_code, f, indent=2, sort_keys=True)
 
-    return dict(pbytes=pbytes, ids_str=ids_str, dt=dt, t=t)
+def _load_can_id_map(path: str) -> dict[str, int]:
+    with open(path, "r") as f:
+        return json.load(f)
 
-def _encode_ids(ids_str: np.ndarray, vocab: dict[str, int] | None):
-    # I construct or apply a CAN ID vocabulary and return one-hot vectors.
-    if vocab is None:
-        uniq = sorted(set(ids_str.tolist()))
-        vocab = {s: i for i, s in enumerate(uniq)}
-    idx = np.array([vocab.get(s, -1) for s in ids_str], dtype=np.int32)
-    idx[idx < 0] = 0
-    onehot = np.eye(len(vocab), dtype=np.float32)[idx]
-    return onehot, vocab
+def _build_can_id_map_from_train(df: pd.DataFrame, cfg: Config) -> dict[str, int]:
+    # Stable ordering: sort unique IDs so mapping is deterministic
+    ids = (
+        df[cfg.id_col]
+        .astype("string")
+        .fillna("")
+        .str.lower()
+        .str.replace("0x", "", regex=False)
+        .unique()
+    )
+    ids = sorted([x for x in ids if x is not None])
+    return {cid: i for i, cid in enumerate(ids)}
 
-def _build_features(tbl: dict, cfg: Config, vocab: dict[str, int] | None, scaler: StandardScaler | None, fit: bool):
-    # I concatenate payload bytes, ID one-hot, and delta_t.
-    onehot, vocab = _encode_ids(tbl["ids_str"], vocab)
-    parts = [tbl["pbytes"], onehot]
-    if cfg.keep_delta_t:
-        parts.append(tbl["dt"])
-    X = np.concatenate(parts, axis=1).astype("float32")
 
-    if fit:
-        scaler = StandardScaler().fit(X)
-    Xn = scaler.transform(X)
-    return Xn, vocab, scaler
-
-def _window_pool_mean(X: np.ndarray, t: np.ndarray, window_ms: int, hop_ms: int):
-    # I implement fixed-duration windows by time and mean-pool rows within each window.
-    w = window_ms / 1000.0
-    h = hop_ms / 1000.0
-    start = float(t[0]); end = float(t[-1])
-    cur = start
-    pooled = []
-    anchors = []
-    while cur + w <= end:
-        mask = (t >= cur) & (t < cur + w)
-        if mask.any():
-            pooled.append(X[mask].mean(axis=0, keepdims=False))
-            anchors.append(cur)
-        cur += h
-    if not pooled:
-        return np.zeros((0, X.shape[1]), dtype="float32"), np.array([], dtype="float32")
-    return np.stack(pooled).astype(np.float32), np.array(anchors, dtype=np.float32)
-
-def _save_npz(path: str, **arrays):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    np.savez_compressed(path, **arrays)
-    print("Saved:", path)
+# ---- Main -------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--max_rows", type=int, default=None,
-                    help="Optional row cap per split for a quick dry run.")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max_rows", type=int, default=None, help="limit rows for quick debugging")
+    args = parser.parse_args()
 
     cfg = Config()
+    print(f"Device: {cfg.device}")
 
-    train_csv = r"data\raw\train_normal.csv"
-    val_csv   = r"data\raw\val_mix.csv"
-    test_csv  = r"data\raw\test_mix.csv"
+    # Train: read once, build ID map, save it
+    df_train = _read_can_csv(cfg.train_csv, cfg, args.max_rows)
+    id_map = _build_can_id_map_from_train(df_train, cfg)
+    _ensure_outdir(cfg.out_dir)
+    id_map_path = os.path.join(cfg.out_dir, "can_id_map.json")
+    _save_can_id_map(id_map_path, id_map)
+    print(f"Saved: {id_map_path}  num_ids={len(id_map)}")
 
-    # Train
-    tr_tbl = _load_table(train_csv, cfg, max_rows=args.max_rows)
-    X_tr, vocab, scaler = _build_features(tr_tbl, cfg, vocab=None, scaler=None, fit=True)
-    Xw_tr, tw_tr = _window_pool_mean(X_tr, tr_tbl["t"], cfg.window_ms, cfg.hop_ms)
-    _save_npz(r"data\processed\train_windows.npz", X=Xw_tr, t=tw_tr)
+    # Process train using the map
+    X_train = _build_feature_matrix(df_train, cfg, id_map)
+    W_train = _windows_torch(X_train, cfg.window_len, cfg.hop, cfg.device)
+    out_train = os.path.join(cfg.out_dir, "train_windows.npz")
+    np.savez_compressed(out_train, X=W_train.astype(np.float32))
+    print(f"Saved: {out_train}  windows={W_train.shape[0]}  win_len={W_train.shape[1]}  feat_dim={W_train.shape[2]}")
 
-    # Val
-    va_tbl = _load_table(val_csv, cfg, max_rows=args.max_rows)
-    X_va, _, _ = _build_features(va_tbl, cfg, vocab=vocab, scaler=scaler, fit=False)
-    Xw_va, tw_va = _window_pool_mean(X_va, va_tbl["t"], cfg.window_ms, cfg.hop_ms)
-    _save_npz(r"data\processed\val_windows.npz", X=Xw_va, t=tw_va)
+    # Val/test: load the map and apply consistently
+    id_map = _load_can_id_map(id_map_path)
+    _process_one(cfg.val_csv, cfg, args.max_rows, "val_windows.npz", id_map)
+    _process_one(cfg.test_csv, cfg, args.max_rows, "test_windows.npz", id_map)
 
-    # Test
-    te_tbl = _load_table(test_csv, cfg, max_rows=args.max_rows)
-    X_te, _, _ = _build_features(te_tbl, cfg, vocab=vocab, scaler=scaler, fit=False)
-    Xw_te, tw_te = _window_pool_mean(X_te, te_tbl["t"], cfg.window_ms, cfg.hop_ms)
-    _save_npz(r"data\processed\test_windows.npz", X=Xw_te, t=tw_te)
-
-    # Artifacts
-    with open(r"data\processed\id_vocab.json", "w") as f:
-        json.dump(vocab, f)
-    np.savez_compressed(r"data\processed\scaler_std.npz",
-                        mean=scaler.mean_.astype("float32"),
-                        scale=scaler.scale_.astype("float32"))
-    print("Artifacts saved in data\\processed")
 
 if __name__ == "__main__":
     main()

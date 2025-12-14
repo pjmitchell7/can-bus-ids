@@ -38,5 +38,5 @@ class Config:
     thresh_percentile: float = 99.0
 
     # Runtime
-    device: str = "cpu"
+    device: str = "cuda" if __import__("torch").cuda.is_available() else "cpu"
     out_dir: str = r"experiments"
