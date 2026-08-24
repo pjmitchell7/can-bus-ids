@@ -1,117 +1,194 @@
-# I rebuild val_mix.csv and test_mix.csv cleanly from the raw HCRL files.
-# I accept headerless attack CSVs (timestamp, CAN_ID, DLC, up to 8 bytes, Flag).
-# I pad missing DATA bytes when DLC < 8 and write consistent headers.
+"""Create disjoint frame ranges while preserving capture boundaries and metadata."""
 
-import os
-import math
-import pandas as pd
+from __future__ import annotations
+
+import argparse
+import json
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-RAW = ROOT / "data" / "raw"
+import numpy as np
+import pandas as pd
 
-# I define the canonical column order I want in the mixes.
-COLS = ["Timestamp","CAN_ID","DLC",
-        "DATA0","DATA1","DATA2","DATA3","DATA4","DATA5","DATA6","DATA7",
-        "Flag","label"]
+from .config import Config, resolve_project_path
+from .utils import sha256_file
 
-def _read_attack(path: Path) -> pd.DataFrame:
-    # I read the headerless attack file and coerce to the 11 fields + Flag.
-    # Some rows have fewer than 8 DATA bytes (DLC < 8); I pad them with "00".
-    # I do not touch hex strings; bytes remain as strings like 'fe', '0A', etc.
-    # Names include placeholders for all 11 fields; Pandas fills missing with NaN.
-    names = ["Timestamp","CAN_ID","DLC",
-             "DATA0","DATA1","DATA2","DATA3","DATA4","DATA5","DATA6","DATA7",
-             "Flag"]
-    df = pd.read_csv(path, header=None, names=names, dtype=str)
-    # I pad missing DATA* with "00" and fill missing DLC with '8' if absent.
-    for b in [f"DATA{i}" for i in range(8)]:
-        if b in df.columns:
-            df[b] = df[b].fillna("00")
-        else:
-            df[b] = "00"
-    if "DLC" in df.columns:
-        df["DLC"] = df["DLC"].fillna("8")
-    else:
-        df["DLC"] = "8"
-    # I ensure core columns exist.
-    if "Flag" not in df.columns:
-        df["Flag"] = "R"
-    # I attach label=1 (attack).
-    df["label"] = 1
-    # I coerce Timestamp to float so ordering by time works.
-    df["Timestamp"] = pd.to_numeric(df["Timestamp"], errors="coerce")
-    # I keep only the canonical columns.
-    return df[COLS]
 
-def _read_normal(path: Path) -> pd.DataFrame:
-    # I read the normal file that already has headers.
-    df = pd.read_csv(path, dtype=str)
-    # I add Flag if missing (normal rows are 'R' in these sets).
-    if "Flag" not in df.columns:
-        df["Flag"] = "R"
-    # I add label=0 (benign).
-    df["label"] = 0
-    # I reorder to canonical columns.
-    return df[COLS]
+RAW_COLUMNS = [
+    "Timestamp", "CAN_ID", "DLC",
+    "DATA0", "DATA1", "DATA2", "DATA3", "DATA4", "DATA5", "DATA6", "DATA7",
+    "Flag",
+]
+BASE_COLUMNS = [*RAW_COLUMNS, "capture_id", "source_row", "attack_family", "label"]
 
-def _concat_and_shuffle(parts: list[pd.DataFrame]) -> pd.DataFrame:
-    # I concatenate and sort by timestamp (stable) to approximate a natural stream.
-    df = pd.concat(parts, ignore_index=True)
-    # Timestamps might have NaN; I fill with forward/backward to keep order deterministic.
-    ts = pd.to_numeric(df["Timestamp"], errors="coerce")
-    ts = ts.ffill().bfill()
-    df["Timestamp"] = ts
-    # I sort by time to mix sources deterministically.
-    df = df.sort_values("Timestamp", kind="mergesort").reset_index(drop=True)
-    return df
 
-def main():
-    # I read sources.
-    normal_csv = RAW / "train_normal.csv"
-    dos_csv    = RAW / "DoS_dataset.csv"
-    fuzzy_csv  = RAW / "Fuzzy_dataset.csv"
-    gear_csv   = RAW / "gear_dataset.csv"
-    rpm_csv    = RAW / "RPM_dataset.csv"
+def flag_to_label(flag: pd.Series) -> pd.Series:
+    """Map injected (T) and replayed/normal (R) frame flags to binary labels."""
+    clean = flag.astype("string").str.strip().str.upper()
+    invalid = ~clean.isin(["T", "R"])
+    if invalid.any():
+        bad = sorted(clean[invalid].dropna().unique().tolist())
+        raise ValueError(f"Unexpected Flag values: {bad}")
+    return clean.eq("T").astype("int8")
 
-    df_norm  = _read_normal(normal_csv)
-    df_dos   = _read_attack(dos_csv)
-    df_fuzzy = _read_attack(fuzzy_csv)
-    df_gear  = _read_attack(gear_csv)
-    df_rpm   = _read_attack(rpm_csv)
 
-    # I build a pooled attack set and cap each attack type to the min count for balance.
-    attacks = [df_dos, df_fuzzy, df_gear, df_rpm]
-    n_min = min(len(x) for x in attacks)
-    attacks_bal = [x.iloc[:n_min].copy() for x in attacks]
-    df_attack_all = _concat_and_shuffle(attacks_bal)
+def _normalize_frame(df: pd.DataFrame, capture_id: str, attack_family: str) -> pd.DataFrame:
+    frame = df.copy()
+    for column in RAW_COLUMNS:
+        if column not in frame.columns:
+            if column.startswith("DATA"):
+                frame[column] = "00"
+            else:
+                raise ValueError(f"Missing required column {column!r}")
+    frame["Flag"] = frame["Flag"].astype("string").str.strip().str.upper()
+    frame["label"] = flag_to_label(frame["Flag"])
+    frame["Timestamp"] = pd.to_numeric(frame["Timestamp"], errors="coerce")
+    frame["CAN_ID"] = (
+        frame["CAN_ID"].astype("string").fillna("").str.strip().str.lower().str.replace("0x", "", regex=False)
+    )
+    frame["DLC"] = pd.to_numeric(frame["DLC"], errors="coerce").fillna(0).clip(0, 8).astype("int16")
+    for column in [f"DATA{i}" for i in range(8)]:
+        frame[column] = frame[column].fillna("00").astype("string").str.strip()
+    frame["capture_id"] = capture_id
+    frame["attack_family"] = attack_family
+    if "source_row" not in frame.columns:
+        frame["source_row"] = np.arange(len(frame), dtype=np.int64)
+    return frame[BASE_COLUMNS]
 
-    # I split attacks 50/50 into val and test.
-    nA = len(df_attack_all)
-    n_val = nA // 2
-    df_attack_val = df_attack_all.iloc[:n_val].copy()
-    df_attack_test = df_attack_all.iloc[n_val:].copy()
 
-    # I take an equal number of benign rows for val and test (or as many as available).
-    df_norm_sorted = df_norm.sort_values("Timestamp", kind="mergesort").reset_index(drop=True)
-    nB_val = min(len(df_norm_sorted) // 2, len(df_attack_val))
-    nB_test = min(len(df_norm_sorted) - nB_val, len(df_attack_test))
+def _read_attack(path: str | Path, capture_id: str, attack_family: str) -> pd.DataFrame:
+    raw = pd.read_csv(path, header=None, names=RAW_COLUMNS, dtype="string")
+    if len(raw) and str(raw.iloc[0]["Timestamp"]).strip().lower() == "timestamp":
+        raw = raw.iloc[1:].reset_index(drop=True)
+    return _normalize_frame(raw, capture_id, attack_family)
 
-    df_norm_val = df_norm_sorted.iloc[:nB_val].copy()
-    df_norm_test = df_norm_sorted.iloc[nB_val:nB_val+nB_test].copy()
 
-    # I assemble val/test mixes and sort by time.
-    df_val = _concat_and_shuffle([df_norm_val, df_attack_val])
-    df_test = _concat_and_shuffle([df_norm_test, df_attack_test])
+def _read_normal(path: str | Path) -> pd.DataFrame:
+    raw = pd.read_csv(path, dtype="string")
+    if "Flag" not in raw.columns:
+        raw["Flag"] = "R"
+    frame = _normalize_frame(raw, "normal", "normal")
+    if bool(frame["label"].any()):
+        raise ValueError("The normal capture contains injected (T) frames")
+    frame["label"] = np.int8(0)
+    return frame
 
-    # I write with header and without index.
-    out_val = RAW / "val_mix.csv"
-    out_test = RAW / "test_mix.csv"
-    df_val.to_csv(out_val, index=False)
-    df_test.to_csv(out_test, index=False)
 
-    print(f"Wrote: {out_val} ({len(df_val):,} rows)")
-    print(f"Wrote: {out_test} ({len(df_test):,} rows)")
+def split_contiguous(df: pd.DataFrame, ratios: tuple[float, float, float]) -> dict[str, pd.DataFrame]:
+    """Split one already ordered capture into contiguous train/val/test ranges."""
+    if len(ratios) != 3 or any(value <= 0 for value in ratios) or not np.isclose(sum(ratios), 1.0):
+        raise ValueError("ratios must contain three positive values summing to 1")
+    n = len(df)
+    train_end = int(np.floor(n * ratios[0]))
+    val_end = train_end + int(np.floor(n * ratios[1]))
+    if n >= 3 and (train_end == 0 or val_end == train_end or val_end == n):
+        raise ValueError("normal split ratio creates an empty frame range")
+    return {
+        "train": df.iloc[:train_end].copy(),
+        "val": df.iloc[train_end:val_end].copy(),
+        "test": df.iloc[val_end:].copy(),
+    }
+
+
+def _source_entry(
+    split: str,
+    frame_path: Path,
+    source_path: Path,
+    frame: pd.DataFrame,
+) -> dict:
+    root = resolve_project_path(".")
+    try:
+        source_value = str(source_path.relative_to(root))
+    except ValueError:
+        source_value = str(source_path)
+    try:
+        frame_value = str(frame_path.relative_to(root))
+    except ValueError:
+        frame_value = str(frame_path)
+    return {
+        "split": split,
+        "capture_id": str(frame["capture_id"].iloc[0]),
+        "attack_family": str(frame["attack_family"].iloc[0]),
+        "source_path": source_value,
+        "source_sha256": sha256_file(source_path),
+        "frame_path": frame_value,
+        "first_source_row": int(frame["source_row"].iloc[0]),
+        "last_source_row": int(frame["source_row"].iloc[-1]),
+        "frame_count": int(len(frame)),
+        "injected_frame_count": int(frame["label"].sum()),
+    }
+
+
+def build_splits(cfg: Config, max_rows: int | None = None) -> Path:
+    """Write independent frame ranges and return the manifest path."""
+    cfg.validate(require_normal_split=True)
+    root = resolve_project_path(".")
+    raw_dir = resolve_project_path(cfg.raw_dir)
+    interim_dir = resolve_project_path(cfg.interim_dir)
+    interim_dir.mkdir(parents=True, exist_ok=True)
+
+    normal_path = raw_dir / cfg.normal_file
+    normal = _read_normal(normal_path)
+    attack_frames = [
+        (family, raw_dir / filename, _read_attack(raw_dir / filename, family, family))
+        for family, filename in cfg.attack_files
+    ]
+    if max_rows is not None:
+        if max_rows <= 0:
+            raise ValueError("max_rows must be positive")
+        normal = normal.iloc[:max_rows].copy()
+        attack_frames = [(family, path, frame.iloc[:max_rows].copy()) for family, path, frame in attack_frames]
+
+    normal = normal.sort_values("source_row", kind="mergesort").reset_index(drop=True)
+    normal_ranges = split_contiguous(normal, cfg.normal_split_ratio)
+    entries: list[dict] = []
+
+    for split, frame in normal_ranges.items():
+        output = interim_dir / f"normal_{split}.csv"
+        frame.to_csv(output, index=False)
+        entries.append(_source_entry(split, output, normal_path, frame))
+
+    for family, source_path, frame in attack_frames:
+        mid = int(np.floor(len(frame) * cfg.attack_val_fraction))
+        ranges = {"val": frame.iloc[:mid].copy(), "test": frame.iloc[mid:].copy()}
+        for split, part in ranges.items():
+            if part.empty:
+                raise ValueError(f"{family} capture has no frames in {split} after splitting")
+            output = interim_dir / f"{family}_{split}.csv"
+            part.to_csv(output, index=False)
+            entries.append(_source_entry(split, output, source_path, part))
+
+    manifest = {
+        "pipeline_version": "corrected_dense_autoencoder_v1",
+        "normal_split_ratio": list(cfg.normal_split_ratio),
+        "attack_val_fraction": cfg.attack_val_fraction,
+        "window_len": cfg.window_len,
+        "hop": cfg.hop,
+        "is_debug": max_rows is not None,
+        "max_rows": max_rows,
+        "entries": entries,
+    }
+    manifest_path = interim_dir / "split_manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+    print(f"Wrote {manifest_path} with {len(entries)} independent ranges")
+    return manifest_path
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--normal-split", nargs=3, type=float, metavar=("TRAIN", "VAL", "TEST"))
+    parser.add_argument("--max-rows", type=int, default=None)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    cfg = Config.from_json(args.config) if args.config else Config()
+    if args.normal_split:
+        cfg.normal_split_ratio = tuple(args.normal_split)
+    build_splits(cfg, max_rows=args.max_rows)
+
 
 if __name__ == "__main__":
     main()
