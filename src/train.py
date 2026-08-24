@@ -1,144 +1,156 @@
-# Train the autoencoder on benign-only windows produced by preprocess.py.
-# I write all artifacts into a timestamped run directory under experiments/.
+"""Train the unchanged dense autoencoder on corrected benign windows."""
 
 from __future__ import annotations
-import os, time, json
+
+import argparse
+import importlib.metadata
+import json
+import platform
 from pathlib import Path
-from dataclasses import asdict
+import random
+import subprocess
+import time
 
 import numpy as np
-import torch as th
-from torch.utils.data import TensorDataset, DataLoader
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 
-from .config import Config
+from .config import Config, resolve_project_path
 from .model_autoencoder import AE
 
 
-def _load_npz_windows(npz_path: Path) -> np.ndarray:
-    """Load windows from npz and normalize to shape [N, F_flat]."""
-    d = np.load(str(npz_path))
-    X = d["X"]
-
-    # Expected common cases:
-    #  - [N, L, D]  -> flatten to [N, L*D]
-    #  - [N, F]     -> already flat
-    #  - [F, N]     -> transpose to [N, F] (rare, but handle)
-    #  - anything else -> collapse all but batch dim
-    if X.ndim == 3:
-        N, L, D = X.shape
-        X = X.reshape(N, L * D)
-    elif X.ndim == 2:
-        # Heuristic: if rows are tiny (e.g., 10 features) and columns huge (looks like N),
-        # it’s probably transposed; flip to [N, F].
-        if X.shape[0] < 64 and X.shape[1] > X.shape[0] * 1000:
-            X = X.T
-        # else: already [N, F]
-    elif X.ndim > 3:
-        N = X.shape[0]
-        X = X.reshape(N, -1)
-    else:
-        raise ValueError(f"Unexpected X.ndim={X.ndim} for {npz_path}")
-
-    # Safety check: no zero columns
-    if X.shape[1] == 0:
-        raise ValueError(f"No features found after reshape for {npz_path}")
-
-    return X.astype("float32", copy=False)
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
-def _join(*parts: str | os.PathLike) -> str:
-    return os.path.join(*map(str, parts))
+def _git_commit() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=resolve_project_path("."),
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
-def run_train(cfg: Config = Config()):
-    # Make run dir
-    os.makedirs(cfg.out_dir, exist_ok=True)
+def _versions() -> dict[str, str]:
+    names = ["numpy", "pandas", "scikit-learn", "torch", "pytest"]
+    versions = {name: importlib.metadata.version(name) for name in names if _has_package(name)}
+    versions["python"] = platform.python_version()
+    return versions
+
+
+def _has_package(name: str) -> bool:
+    try:
+        importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+def _load_train_windows(cfg: Config) -> np.ndarray:
+    path = resolve_project_path(cfg.processed_dir) / "train_windows.npz"
+    with np.load(path, allow_pickle=False) as data:
+        X = data["X"]
+    if X.ndim != 3 or X.shape[1:] != (cfg.window_len, len(cfg.feature_order)):
+        raise ValueError(f"Expected train windows [N,{cfg.window_len},10], got {X.shape}")
+    return X.reshape(len(X), -1).astype(np.float32, copy=False)
+
+
+def run_train(cfg: Config | None = None) -> Path:
+    cfg = cfg or Config()
+    cfg.validate()
+    seed_everything(cfg.seed)
+    X = _load_train_windows(cfg)
+    if len(X) == 0:
+        raise ValueError("No training windows were produced")
+
+    experiment_dir = resolve_project_path(cfg.experiment_dir)
+    experiment_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = _join(cfg.out_dir, f"run_{stamp}")
-    os.makedirs(run_dir, exist_ok=True)
+    run_dir = experiment_dir / f"run_corrected_{stamp}"
+    suffix = 1
+    while run_dir.exists():
+        run_dir = experiment_dir / f"run_corrected_{stamp}_{suffix}"
+        suffix += 1
+    run_dir.mkdir()
 
-    # Load train windows robustly (OS-neutral path)
-    train_npz = _join("data", "processed", "train_windows.npz")
-    if not os.path.exists(train_npz):
-        # Try alternative separators if someone wrote backslashes literally
-        alt_path = Path("data") / "processed" / "train_windows.npz"
-        if alt_path.exists():
-            train_npz = str(alt_path)
-        else:
-            raise FileNotFoundError(f"Could not find train windows at {train_npz}")
+    tensor = torch.from_numpy(X)
+    loader = DataLoader(
+        TensorDataset(tensor),
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=False,
+        generator=torch.Generator().manual_seed(cfg.seed),
+    )
+    model = AE(in_dim=X.shape[1], hidden=cfg.hidden_sizes, dropout=cfg.dropout).to(cfg.device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    criterion = torch.nn.MSELoss()
 
-    X = _load_npz_windows(Path(train_npz))
-
-    # Build dataset/loader
-    device = cfg.device
-    X_tensor = th.tensor(X, dtype=th.float32)
-    ds = TensorDataset(X_tensor)
-    dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False)
-
-    # Model
-    in_dim = X_tensor.shape[1]  # flattened feature count
-    model = AE(in_dim=in_dim, hidden=cfg.hidden_sizes, dropout=cfg.dropout).to(device)
-
-    # Loss/opt
-    opt = th.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    crit = th.nn.MSELoss()
-
-    if device == "cpu":
-        th.set_num_threads(max(1, th.get_num_threads()))
-
-    # Train
-    losses = []
+    losses: list[float] = []
     model.train()
-    for ep in range(cfg.epochs):
-        ep_loss = 0.0
+    for epoch in range(cfg.epochs):
+        total = 0.0
         seen = 0
-        for (xb,) in dl:
-            # Ensure 2D [B, F] before the first Linear
-            if xb.ndim > 2:
-                xb = xb.view(xb.size(0), -1)
-            elif xb.ndim == 1:
-                xb = xb.view(1, -1)
-
-            # Guard against accidental mismatches
-            if xb.shape[1] != in_dim:
-                raise RuntimeError(
-                    f"Input feature mismatch: xb has {xb.shape[1]} features, "
-                    f"but model was built with in_dim={in_dim}."
-                )
-
-            xb = xb.to(device, non_blocking=True)
-            opt.zero_grad(set_to_none=True)
-            xhat, _ = model(xb)
-            loss = crit(xhat, xb)
+        for (batch,) in loader:
+            batch = batch.to(cfg.device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            reconstruction, _ = model(batch)
+            loss = criterion(reconstruction, batch)
             loss.backward()
-            opt.step()
+            optimizer.step()
+            total += float(loss.item()) * len(batch)
+            seen += len(batch)
+        epoch_loss = total / max(1, seen)
+        losses.append(epoch_loss)
+        print(f"[{epoch + 1:02d}/{cfg.epochs:02d}] loss={epoch_loss:.6f}")
 
-            ep_loss += loss.item() * xb.size(0)
-            seen += xb.size(0)
+    torch.save(model.state_dict(), run_dir / "model.pt")
+    np.save(run_dir / "losses.npy", np.asarray(losses, dtype=np.float32))
+    cfg.save_json(run_dir / "cfg.json")
 
-        ep_loss /= max(1, seen)
-        losses.append(ep_loss)
-        print(f"[{ep+1:02d}/{cfg.epochs:02d}] loss={ep_loss:.6f}")
+    processed_dir = resolve_project_path(cfg.processed_dir)
+    for filename in ["can_id_map.json", "scaler.npz", "preprocess_meta.json"]:
+        source = processed_dir / filename
+        if source.exists():
+            (run_dir / filename).write_bytes(source.read_bytes())
 
-    # Save artifacts
-    th.save(model.state_dict(), _join(run_dir, "model.pt"))
-    np.save(_join(run_dir, "losses.npy"), np.array(losses, dtype=np.float32))
-
-    # Copy preprocessing artifacts if present
-    for fname in ["id_vocab.json", "scaler_std.npz"]:
-        src = _join("data", "processed", fname)
-        dst = _join(run_dir, fname)
-        if os.path.exists(src):
-            with open(src, "rb") as fi, open(dst, "wb") as fo:
-                fo.write(fi.read())
-
-    # Save the effective config
-    with open(_join(run_dir, "cfg.json"), "w") as f:
-        json.dump(asdict(cfg), f, indent=2)
-
-    print("Saved run to", run_dir)
+    metadata = {
+        "pipeline_version": "corrected_dense_autoencoder_v1",
+        "seed": cfg.seed,
+        "git_commit": _git_commit(),
+        "device": cfg.device,
+        "input_shape": [cfg.window_len, len(cfg.feature_order)],
+        "flattened_input_dim": int(X.shape[1]),
+        "parameter_count": int(sum(parameter.numel() for parameter in model.parameters())),
+        "dependency_versions": _versions(),
+        "processed_dir": str(processed_dir),
+        "is_debug": "debug_maxrows_" in str(processed_dir),
+    }
+    preprocess_meta = processed_dir / "preprocess_meta.json"
+    if preprocess_meta.exists():
+        with open(preprocess_meta, encoding="utf-8") as handle:
+            metadata["data_hashes"] = json.load(handle).get("source_file_hashes", {})
+    with open(run_dir / "run_meta.json", "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+    print(f"Saved run to {run_dir}")
     return run_dir
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, default=None)
+    args = parser.parse_args()
+    cfg = Config.from_json(args.config) if args.config else Config()
+    run_train(cfg)
+
+
 if __name__ == "__main__":
-    run_train()
+    main()
