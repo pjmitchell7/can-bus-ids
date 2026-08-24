@@ -1,0 +1,33 @@
+{
+  "raw_dir": "data/raw",
+  "interim_dir": "data/interim",
+  "processed_dir": "data/processed",
+  "experiment_dir": "experiments",
+  "normal_file": "train_normal.csv",
+  "attack_files": [
+    ["dos", "DoS_dataset.csv"],
+    ["fuzzy", "Fuzzy_dataset.csv"],
+    ["gear", "gear_dataset.csv"],
+    ["rpm", "RPM_dataset.csv"]
+  ],
+  "normal_split_ratio": [0.6, 0.2, 0.2],
+  "attack_val_fraction": 0.5,
+  "window_len": 64,
+  "hop": 32,
+  "normalize": "zscore",
+  "scaler_epsilon": 1e-8,
+  "unknown_id_code": -1,
+  "hidden_sizes": [128, 64, 32],
+  "dropout": 0.1,
+  "lr": 0.001,
+  "weight_decay": 0.00001,
+  "batch_size": 256,
+  "epochs": 30,
+  "threshold_method": "train_percentile",
+  "threshold_percentile": 99.0,
+  "eval_batch_size": 4096,
+  "latency_batch_size": 1024,
+  "latency_repetitions": 100,
+  "seed": 42,
+  "device": "cuda"
+}

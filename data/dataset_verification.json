@@ -1,0 +1,210 @@
+{
+  "dataset": "HCRL Car-Hacking Dataset",
+  "source": "https://ocslab.hksecurity.net/Datasets/car-hacking-dataset",
+  "verification_date": "2026-08-24",
+  "raw_directory": "data\\raw",
+  "expected_files": [
+    "DoS_dataset.csv",
+    "Fuzzy_dataset.csv",
+    "RPM_dataset.csv",
+    "gear_dataset.csv",
+    "train_normal.csv"
+  ],
+  "present_files": [
+    "DoS_dataset.csv",
+    "Fuzzy_dataset.csv",
+    "RPM_dataset.csv",
+    "gear_dataset.csv",
+    "train_normal.csv"
+  ],
+  "missing_files": [],
+  "unexpected_files": [],
+  "nested_files": [],
+  "flag_semantics": {
+    "T": 1,
+    "R": 0
+  },
+  "parser_columns": [
+    "Timestamp",
+    "CAN_ID",
+    "DLC",
+    "DATA0",
+    "DATA1",
+    "DATA2",
+    "DATA3",
+    "DATA4",
+    "DATA5",
+    "DATA6",
+    "DATA7",
+    "Flag"
+  ],
+  "records": [
+    {
+      "kind": "normal",
+      "file": "train_normal.csv",
+      "size_bytes": 49443620,
+      "sha256": "c57c25f6932a7104eb1ee889fec952062779f14bfd442c1e5d759818db80225d",
+      "row_count": 988871,
+      "raw_width_counts": {
+        "11": 988871
+      },
+      "flag_counts": {
+        "R": 988871,
+        "T": 0
+      },
+      "first_timestamp": 1479121434.850202,
+      "last_timestamp": 1479121941.286773,
+      "timestamps_non_decreasing": true,
+      "parser_columns": [
+        "Timestamp",
+        "CAN_ID",
+        "DLC",
+        "DATA0",
+        "DATA1",
+        "DATA2",
+        "DATA3",
+        "DATA4",
+        "DATA5",
+        "DATA6",
+        "DATA7",
+        "Flag"
+      ],
+      "flag_source": "implicit R supplied by src.make_splits._read_normal"
+    },
+    {
+      "kind": "dos",
+      "file": "DoS_dataset.csv",
+      "size_bytes": 190058708,
+      "sha256": "09bf3136647b1d846d13c374f26208f06ffeba18369093fc57c8076fc56b795e",
+      "row_count": 3665771,
+      "raw_width_counts": {
+        "12": 3634583,
+        "6": 31188
+      },
+      "flag_counts": {
+        "R": 3078250,
+        "T": 587521
+      },
+      "first_timestamp": 1478198376.389427,
+      "last_timestamp": 1478201209.058944,
+      "timestamps_non_decreasing": true,
+      "parser_columns": [
+        "Timestamp",
+        "CAN_ID",
+        "DLC",
+        "DATA0",
+        "DATA1",
+        "DATA2",
+        "DATA3",
+        "DATA4",
+        "DATA5",
+        "DATA6",
+        "DATA7",
+        "Flag"
+      ],
+      "flag_source": "raw HCRL Flag field after the DLC-dependent payload"
+    },
+    {
+      "kind": "fuzzy",
+      "file": "Fuzzy_dataset.csv",
+      "size_bytes": 198520767,
+      "sha256": "a0e78dff6365a1ad3d314973f1ac5879b57f9b80c40eb07b1e3bbe4aeddaecfe",
+      "row_count": 3838860,
+      "raw_width_counts": {
+        "12": 3751024,
+        "9": 53451,
+        "6": 34382,
+        "10": 3
+      },
+      "flag_counts": {
+        "R": 3347013,
+        "T": 491847
+      },
+      "first_timestamp": 1478195721.903877,
+      "last_timestamp": 1478201209.058944,
+      "timestamps_non_decreasing": true,
+      "parser_columns": [
+        "Timestamp",
+        "CAN_ID",
+        "DLC",
+        "DATA0",
+        "DATA1",
+        "DATA2",
+        "DATA3",
+        "DATA4",
+        "DATA5",
+        "DATA6",
+        "DATA7",
+        "Flag"
+      ],
+      "flag_source": "raw HCRL Flag field after the DLC-dependent payload"
+    },
+    {
+      "kind": "gear",
+      "file": "gear_dataset.csv",
+      "size_bytes": 230320414,
+      "sha256": "b4eba43605fff337117ff30e13c33f63b56eec3b00927c8bccb31192df3bee23",
+      "row_count": 4443142,
+      "raw_width_counts": {
+        "12": 4402977,
+        "6": 40165
+      },
+      "flag_counts": {
+        "R": 3845890,
+        "T": 597252
+      },
+      "first_timestamp": 1478193190.056566,
+      "last_timestamp": 1478201209.058944,
+      "timestamps_non_decreasing": true,
+      "parser_columns": [
+        "Timestamp",
+        "CAN_ID",
+        "DLC",
+        "DATA0",
+        "DATA1",
+        "DATA2",
+        "DATA3",
+        "DATA4",
+        "DATA5",
+        "DATA6",
+        "DATA7",
+        "Flag"
+      ],
+      "flag_source": "raw HCRL Flag field after the DLC-dependent payload"
+    },
+    {
+      "kind": "rpm",
+      "file": "RPM_dataset.csv",
+      "size_bytes": 239581936,
+      "sha256": "6718c6cb0a5fe6bdf0e966a680f1d6d7d79c063d603254d6118c16aaeb74974d",
+      "row_count": 4621702,
+      "raw_width_counts": {
+        "12": 4580226,
+        "6": 41476
+      },
+      "flag_counts": {
+        "R": 3966805,
+        "T": 654897
+      },
+      "first_timestamp": 1478191030.045114,
+      "last_timestamp": 1478201209.058944,
+      "timestamps_non_decreasing": true,
+      "parser_columns": [
+        "Timestamp",
+        "CAN_ID",
+        "DLC",
+        "DATA0",
+        "DATA1",
+        "DATA2",
+        "DATA3",
+        "DATA4",
+        "DATA5",
+        "DATA6",
+        "DATA7",
+        "Flag"
+      ],
+      "flag_source": "raw HCRL Flag field after the DLC-dependent payload"
+    }
+  ],
+  "passed": true
+}

@@ -2,15 +2,16 @@
 
 ## Current phase
 
-Phase 5: code repair and synthetic verification complete; full-data rerun is pending dataset placement and split-ratio approval.
+Phase 6: official raw data verified, chronological split completed, and bounded preprocessing validation passed. HPC execution remains pending account access and is not claimed here.
 
 ## Starting point
 
 - Audited commit: `9956ad12ec61d44aaefdef8e907776b7086120cd`
 - Repair branch: `fix/baseline-pipeline`
 - Starting working tree: clean
-- Raw dataset files: not available in the local workspace or Downloads search
-- Tracked `data` entries: stale symlink targets to `/scratch/pjmitchell/CAN_Bus_Security/data`
+- Raw dataset files: official HCRL captures are present under `data/raw/` and are ignored by Git
+- Dataset evidence: `data/dataset_verification.json` records names, sizes, row counts, SHA-256 hashes, widths, timestamps, and flags
+- Tracked `data` entries: stale symlink targets to `/scratch/pjmitchell/CAN_Bus_Security/data` were not used
 
 ## Audit checklist
 
@@ -27,17 +28,20 @@ Phase 5: code repair and synthetic verification complete; full-data rerun is pen
 
 ## Verification
 
-- 12 synthetic regression tests pass.
-- The synthetic pipeline produces independent ranges, train-only preprocessing artifacts, and capture-safe windows.
+- 13 parser and synthetic regression tests pass.
+- The full raw data produces 11 independent chronological ranges using normal 60/20/20 and attack 50/50 splits.
+- A bounded 2,000-row-per-range preprocessing run produced 64-frame, hop-32 capture-safe windows and train-only preprocessing artifacts.
 - No corrected full-data metrics exist yet.
 
 ## Remaining work
 
-- [ ] Approve and set the normal train/validation/test ratio.
-- [ ] Place the five raw dataset files under data/raw/.
-- [ ] Run corrected preprocessing, dense-autoencoder training, both threshold modes, and the repeated latency probe.
-- [ ] Review saved metrics and commit the remaining documentation/run evidence.
+- [x] Approve and set the normal train/validation/test ratio to 60/20/20.
+- [x] Place and verify the five official raw dataset files under `data/raw/`.
+- [x] Build chronological split files and manifest without shuffling or cross-boundary ranges.
+- [x] Validate parser behavior locally, including DLC-dependent attack rows and T/R semantics.
+- [ ] Run full corrected preprocessing, dense-autoencoder training, both threshold modes, and the repeated latency probe.
+- [ ] Run the prepared HPC workflow after account access and data transfer are available.
 
 ## Pending approval
 
-The normal capture split ratio must be explicit, but the handoff does not prescribe its value. Synthetic tests and code repairs can proceed before choosing it; full corrected preprocessing and reruns cannot.
+The local `config.json` uses the user-approved 60/20/20 normal split, 50/50 attack validation/test split, 64-frame windows, hop 32, and CPU. The full training/evaluation run is intentionally not reported because the local Torch package is incomplete and HPC access is not yet available.

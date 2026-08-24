@@ -12,7 +12,13 @@ The dataset is not committed. Put these files in `data/raw/`:
 - `gear_dataset.csv`
 - `RPM_dataset.csv`
 
-The attack captures are headerless HCRL CSV files with Timestamp, CAN ID, DLC, up to eight payload bytes, and a Flag column. The converter in tools/convert_txt_to_csv.py accepts text-log input and explicit --input/--output paths.
+The attack captures are headerless HCRL CSV files with Timestamp, CAN ID, DLC, a DLC-dependent number of payload bytes, and a Flag column. The parser locates Flag after the payload rather than assuming a fixed twelve-field row, then pads missing DATA columns with `00`. The converter in tools/convert_txt_to_csv.py accepts text-log input and explicit --input/--output paths.
+
+Validate the raw captures, including sizes, row counts, hashes, widths, timestamps, and T/R values, with:
+
+```
+python tools/validate_raw_dataset.py --output data/dataset_verification.json
+```
 
 ## Pipeline
 
@@ -42,6 +48,7 @@ Copy config.example.json to config.json, then set the approved normal split rati
 
 ```
 python -m pytest -q
+python tools/validate_raw_dataset.py --output data/dataset_verification.json
 python -m src.make_splits --config config.json
 python -m src.preprocess --config config.json
 python -m src.train --config config.json

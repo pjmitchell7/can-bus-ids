@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from src.make_splits import flag_to_label, split_contiguous
+from src.make_splits import _read_attack, flag_to_label, split_contiguous
 
 
 def test_flag_semantics_are_strict():
@@ -19,3 +19,14 @@ def test_contiguous_split_preserves_order_and_is_disjoint():
     assert parts["test"]["source_row"].tolist() == [6, 7]
     assert set(parts["train"]["source_row"]).isdisjoint(parts["val"]["source_row"])
     assert set(parts["train"]["source_row"]).isdisjoint(parts["test"]["source_row"])
+
+
+def test_attack_parser_places_flag_after_variable_dlc_payload(tmp_path):
+    path = tmp_path / "attack.csv"
+    path.write_text("1.0,100,2,AA,BB,T\n", encoding="utf-8")
+    frame = _read_attack(path, "dos", "dos")
+    assert frame.loc[0, "Flag"] == "T"
+    assert frame.loc[0, "DATA0"] == "AA"
+    assert frame.loc[0, "DATA1"] == "BB"
+    assert frame.loc[0, "DATA2"] == "00"
+    assert frame.loc[0, "label"] == 1

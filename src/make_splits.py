@@ -25,8 +25,10 @@ def flag_to_label(flag: pd.Series) -> pd.Series:
     """Map injected (T) and replayed/normal (R) frame flags to binary labels."""
     clean = flag.astype("string").str.strip().str.upper()
     invalid = ~clean.isin(["T", "R"])
-    if invalid.any():
+    if clean.isna().any() or invalid.any():
         bad = sorted(clean[invalid].dropna().unique().tolist())
+        if clean.isna().any():
+            bad.append("<missing>")
         raise ValueError(f"Unexpected Flag values: {bad}")
     return clean.eq("T").astype("int8")
 
@@ -56,10 +58,33 @@ def _normalize_frame(df: pd.DataFrame, capture_id: str, attack_family: str) -> p
 
 
 def _read_attack(path: str | Path, capture_id: str, attack_family: str) -> pd.DataFrame:
-    raw = pd.read_csv(path, header=None, names=RAW_COLUMNS, dtype="string")
-    if len(raw) and str(raw.iloc[0]["Timestamp"]).strip().lower() == "timestamp":
+    raw = pd.read_csv(path, header=None, names=list(range(12)), dtype="string")
+    if len(raw) and str(raw.iloc[0, 0]).strip().lower() == "timestamp":
         raw = raw.iloc[1:].reset_index(drop=True)
-    return _normalize_frame(raw, capture_id, attack_family)
+    if raw.empty:
+        raise ValueError(f"Attack capture is empty: {path}")
+
+    values = raw.to_numpy(dtype=object)
+    dlc = pd.to_numeric(raw.iloc[:, 2], errors="coerce").fillna(0).clip(0, 8).astype(int).to_numpy()
+    row_index = np.arange(len(raw))
+    flag_position = 3 + dlc
+    if int(flag_position.max()) >= values.shape[1]:
+        raise ValueError(f"Attack capture has rows shorter than DLC requires: {path}")
+    frame = pd.DataFrame({
+        "Timestamp": raw.iloc[:, 0],
+        "CAN_ID": raw.iloc[:, 1],
+        "DLC": raw.iloc[:, 2],
+        "Flag": values[row_index, flag_position],
+    })
+    for index in range(8):
+        column = np.full(len(raw), pd.NA, dtype=object)
+        present = dlc > index
+        if present.any():
+            if 3 + index >= values.shape[1]:
+                raise ValueError(f"Attack capture has a row shorter than DLC requires: {path}")
+            column[present] = values[present, 3 + index]
+        frame[f"DATA{index}"] = column
+    return _normalize_frame(frame, capture_id, attack_family)
 
 
 def _read_normal(path: str | Path) -> pd.DataFrame:
@@ -94,6 +119,7 @@ def _source_entry(
     frame_path: Path,
     source_path: Path,
     frame: pd.DataFrame,
+    source_row_count: int,
 ) -> dict:
     root = resolve_project_path(".")
     try:
@@ -110,6 +136,8 @@ def _source_entry(
         "attack_family": str(frame["attack_family"].iloc[0]),
         "source_path": source_value,
         "source_sha256": sha256_file(source_path),
+        "source_size_bytes": int(source_path.stat().st_size),
+        "source_row_count": int(source_row_count),
         "frame_path": frame_value,
         "first_source_row": int(frame["source_row"].iloc[0]),
         "last_source_row": int(frame["source_row"].iloc[-1]),
@@ -128,15 +156,12 @@ def build_splits(cfg: Config, max_rows: int | None = None) -> Path:
 
     normal_path = raw_dir / cfg.normal_file
     normal = _read_normal(normal_path)
-    attack_frames = [
-        (family, raw_dir / filename, _read_attack(raw_dir / filename, family, family))
-        for family, filename in cfg.attack_files
-    ]
+    normal_source_row_count = len(normal)
+    attack_sources = [(family, raw_dir / filename) for family, filename in cfg.attack_files]
     if max_rows is not None:
         if max_rows <= 0:
             raise ValueError("max_rows must be positive")
         normal = normal.iloc[:max_rows].copy()
-        attack_frames = [(family, path, frame.iloc[:max_rows].copy()) for family, path, frame in attack_frames]
 
     normal = normal.sort_values("source_row", kind="mergesort").reset_index(drop=True)
     normal_ranges = split_contiguous(normal, cfg.normal_split_ratio)
@@ -145,9 +170,13 @@ def build_splits(cfg: Config, max_rows: int | None = None) -> Path:
     for split, frame in normal_ranges.items():
         output = interim_dir / f"normal_{split}.csv"
         frame.to_csv(output, index=False)
-        entries.append(_source_entry(split, output, normal_path, frame))
+        entries.append(_source_entry(split, output, normal_path, frame, normal_source_row_count))
 
-    for family, source_path, frame in attack_frames:
+    for family, source_path in attack_sources:
+        frame = _read_attack(source_path, family, family)
+        source_row_count = len(frame)
+        if max_rows is not None:
+            frame = frame.iloc[:max_rows].copy()
         mid = int(np.floor(len(frame) * cfg.attack_val_fraction))
         ranges = {"val": frame.iloc[:mid].copy(), "test": frame.iloc[mid:].copy()}
         for split, part in ranges.items():
@@ -155,7 +184,7 @@ def build_splits(cfg: Config, max_rows: int | None = None) -> Path:
                 raise ValueError(f"{family} capture has no frames in {split} after splitting")
             output = interim_dir / f"{family}_{split}.csv"
             part.to_csv(output, index=False)
-            entries.append(_source_entry(split, output, source_path, part))
+            entries.append(_source_entry(split, output, source_path, part, source_row_count))
 
     manifest = {
         "pipeline_version": "corrected_dense_autoencoder_v1",

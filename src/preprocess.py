@@ -162,6 +162,13 @@ def process(cfg: Config, max_rows: int | None = None, out_dir: str | Path | None
     _save_windows(output_dir / "test_windows.npz", test)
 
     source_hashes = {entry["source_path"]: entry["source_sha256"] for entry in entries}
+    source_file_info = {}
+    for entry in entries:
+        source_file_info[entry["source_path"]] = {
+            "sha256": entry["source_sha256"],
+            "size_bytes": entry["source_size_bytes"],
+            "row_count": entry["source_row_count"],
+        }
     split_hashes = {
         entry["frame_path"]: sha256_file(root / entry["frame_path"])
         for entry in entries
@@ -178,6 +185,7 @@ def process(cfg: Config, max_rows: int | None = None, out_dir: str | Path | None
         "scaler_filename": "scaler.npz",
         "split_manifest_sha256": sha256_file(manifest_path),
         "source_file_hashes": source_hashes,
+        "source_file_info": source_file_info,
         "split_file_hashes": split_hashes,
         "is_debug": max_rows is not None,
         "debug_max_rows": max_rows,
