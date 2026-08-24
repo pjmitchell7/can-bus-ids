@@ -1,21 +1,39 @@
-# Small helpers I reuse across scripts.
+"""Small parsing and reproducibility helpers."""
 
-def parse_payload(s: str):
-    # I accept strings like "00 7A 3F 01 00 00 00 00" or "007A3F0100000000".
-    # I return exactly 8 integers (0..255).
-    if not isinstance(s, str):
-        s = str(s)
-    s = s.strip().replace(" ", "").replace("0x", "").replace("0X", "")
-    if not s:
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+
+def parse_payload(s: str) -> list[int]:
+    """Convert a payload string or byte token to eight integer byte values."""
+    value = str(s).strip().replace(" ", "").replace("0x", "").replace("0X", "")
+    if not value:
         return [0] * 8
-    bytes_hex = [s[i:i+2] for i in range(0, len(s), 2)]
-    while len(bytes_hex) < 8:
-        bytes_hex.append("00")
-    bytes_hex = bytes_hex[:8]
-    out = []
-    for b in bytes_hex:
+    chunks = [value[i:i + 2] for i in range(0, len(value), 2)][:8]
+    result: list[int] = []
+    for chunk in chunks:
         try:
-            out.append(int(b, 16))
-        except Exception:
-            out.append(0)
-    return out
+            number = int(chunk, 16)
+        except ValueError:
+            number = 0
+        result.append(max(0, min(255, number)))
+    return (result + [0] * 8)[:8]
+
+
+def hex_byte_to_int(value: object) -> int:
+    """Convert one hexadecimal byte token to an integer, defaulting malformed data to zero."""
+    try:
+        number = int(str(value).strip().replace("0x", "").replace("0X", ""), 16)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(255, number))
+
+
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()

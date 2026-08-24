@@ -1,236 +1,206 @@
-# -*- coding: utf-8 -*-
+"""Fit train-only preprocessing and build capture-safe window artifacts."""
+
 from __future__ import annotations
-import os
+
 import argparse
-from dataclasses import dataclass, field
-from typing import List, Optional
 import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import torch
 
-# ---- Config -----------------------------------------------------------------
+from .config import Config, resolve_project_path
+from .utils import hex_byte_to_int, sha256_file
 
-@dataclass
-class Config:
-    # Raw CSVs
-    train_csv: str = "data/raw/train_normal.csv"
-    val_csv:   str = "data/raw/val_mix.csv"
-    test_csv:  str = "data/raw/test_mix.csv"
 
-    # Expected columns
-    ts_col: str = "Timestamp"
-    id_col: str = "CAN_ID"
-    dlc_col: str = "DLC"
-    payload_cols: List[str] = field(default_factory=lambda: [
-        "DATA0","DATA1","DATA2","DATA3","DATA4","DATA5","DATA6","DATA7"
-    ])
+def window_starts(n_frames: int, window_len: int, hop: int) -> np.ndarray:
+    """Return starts for overlapping windows that fit inside one frame range."""
+    if n_frames < window_len:
+        return np.empty(0, dtype=np.int64)
+    return np.arange(0, n_frames - window_len + 1, hop, dtype=np.int64)
 
-    # Windowing
-    window_len: int = 64   # frames per window
-    hop:        int = 32   # stride
 
-    # Runtime
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+def fit_scaler(X_train: np.ndarray, epsilon: float = 1e-8) -> tuple[np.ndarray, np.ndarray]:
+    """Fit feature-wise population mean/std and protect constant features."""
+    if X_train.ndim != 2 or len(X_train) == 0:
+        raise ValueError("X_train must be a non-empty two-dimensional matrix")
+    mean = X_train.mean(axis=0, dtype=np.float64)
+    std = X_train.std(axis=0, dtype=np.float64)
+    std[std < epsilon] = 1.0
+    return mean.astype(np.float32), std.astype(np.float32)
 
-    # Output
-    out_dir: str = "data/processed"
 
-# ---- Utilities ---------------------------------------------------------------
-
-def _ensure_outdir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-def _hex_lookup_table() -> np.ndarray:
-    # Map b"00".."ff" to 0..255 for vectorized hex decode
-    lut = np.full((256, 256), -1, dtype=np.int16)
-    hexd = b"0123456789abcdefABCDEF"
-    for hi in range(256):
-        for lo in range(256):
-            s = bytes([hi, lo])
-            if s[0] in hexd and s[1] in hexd:
-                try:
-                    lut[hi, lo] = int(s.decode("ascii"), 16)
-                except Exception:
-                    pass
-    return lut
-
-_LUT = _hex_lookup_table()
-
-def _hex_series_to_uint8(series: pd.Series) -> np.ndarray:
-    # Convert series of strings like "fe","0a" to uint8
-    s = series.astype("string").fillna("00").str.strip().str.slice(0, 2).astype("string")
-    arr = s.to_numpy(dtype=object)
-    first  = np.frombuffer("".join([x[0] if len(x) > 0 else "0" for x in arr]).encode("ascii"), dtype=np.uint8)
-    second = np.frombuffer("".join([x[1] if len(x) > 1 else "0" for x in arr]).encode("ascii"), dtype=np.uint8)
-    out = _LUT[first, second].astype(np.int16)
-    out[out < 0] = 0
-    return out.astype(np.uint8)
-
-def _read_can_csv(path: str, cfg: Config, max_rows: Optional[int]) -> pd.DataFrame:
-    # Build desired usecols, then intersect with actual header so I can optionally pull label
-    header_cols = pd.read_csv(path, nrows=0).columns.tolist()
-    desired = [cfg.ts_col, cfg.id_col, cfg.dlc_col] + cfg.payload_cols
-    if "label" in header_cols:
-        desired += ["label"]
-    usecols = [c for c in desired if c in header_cols]
-
-    dtypes = {
-        cfg.ts_col:  "float64",
-        cfg.id_col:  "string",
-        cfg.dlc_col: "int16",
-        **{c: "string" for c in cfg.payload_cols},
+def build_window_arrays(
+    X_frames: np.ndarray,
+    labels: np.ndarray,
+    frame_meta: pd.DataFrame,
+    window_len: int,
+    hop: int,
+) -> dict[str, np.ndarray]:
+    """Build features, labels, and metadata from one independent capture range."""
+    if len(X_frames) != len(labels) or len(X_frames) != len(frame_meta):
+        raise ValueError("frame features, labels, and metadata must have the same length")
+    starts = window_starts(len(X_frames), window_len, hop)
+    empty_X = np.empty((0, window_len, X_frames.shape[1]), dtype=np.float32)
+    if len(starts) == 0:
+        return {
+            "X": empty_X,
+            "y": np.empty(0, dtype=np.int8),
+            "capture_id": np.empty(0, dtype="U1"),
+            "attack_family": np.empty(0, dtype="U1"),
+            "window_start_row": np.empty(0, dtype=np.int64),
+            "window_end_row": np.empty(0, dtype=np.int64),
+        }
+    X = np.stack([X_frames[start:start + window_len] for start in starts]).astype(np.float32)
+    y = np.array([labels[start:start + window_len].any() for start in starts], dtype=np.int8)
+    return {
+        "X": X,
+        "y": y,
+        "capture_id": np.asarray(frame_meta.iloc[starts]["capture_id"].astype(str), dtype="U"),
+        "attack_family": np.asarray(frame_meta.iloc[starts]["attack_family"].astype(str), dtype="U"),
+        "window_start_row": frame_meta.iloc[starts]["source_row"].astype(np.int64).to_numpy(),
+        "window_end_row": frame_meta.iloc[starts + window_len - 1]["source_row"].astype(np.int64).to_numpy(),
     }
-    if "label" in usecols:
-        dtypes["label"] = "int8"
 
-    df = pd.read_csv(
-        path,
-        usecols=usecols,
-        dtype=dtypes,
-        nrows=max_rows,
-        engine="c",
-        low_memory=False,
+
+def _normalize_id(value: object) -> str:
+    return str(value).strip().lower().replace("0x", "")
+
+
+def _frame_matrix(frame: pd.DataFrame, cfg: Config, id_to_code: dict[str, int]) -> np.ndarray:
+    payload = np.array(
+        [[hex_byte_to_int(row[column]) for column in cfg.payload_cols] for _, row in frame.iterrows()],
+        dtype=np.float32,
+    )
+    dlc = pd.to_numeric(frame[cfg.dlc_col], errors="coerce").fillna(0).clip(0, 8).to_numpy(dtype=np.float32)
+    ids = frame[cfg.can_id_col].map(_normalize_id)
+    can_id = ids.map(lambda value: id_to_code.get(value, cfg.unknown_id_code)).to_numpy(dtype=np.float32)
+    return np.column_stack([payload, dlc, can_id]).astype(np.float32)
+
+
+def build_id_map(frames: list[pd.DataFrame], cfg: Config) -> dict[str, int]:
+    ids: set[str] = set()
+    for frame in frames:
+        ids.update(frame[cfg.can_id_col].map(_normalize_id).tolist())
+    ids.discard("")
+    return {can_id: index for index, can_id in enumerate(sorted(ids))}
+
+
+def _save_windows(path: Path, arrays: dict[str, np.ndarray], include_labels: bool = True) -> None:
+    values = {"X": arrays["X"].astype(np.float32)}
+    if include_labels:
+        values.update({key: value for key, value in arrays.items() if key != "X"})
+    np.savez_compressed(path, **values)
+
+
+def process(cfg: Config, max_rows: int | None = None, out_dir: str | Path | None = None) -> Path:
+    """Process every manifest range independently and return the output directory."""
+    cfg.validate()
+    manifest_path = resolve_project_path(cfg.interim_dir) / "split_manifest.json"
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    root = resolve_project_path(".")
+    output_dir = resolve_project_path(out_dir) if out_dir else resolve_project_path(cfg.processed_dir)
+    if max_rows is not None:
+        if max_rows <= 0:
+            raise ValueError("max_rows must be positive")
+        if out_dir is None:
+            output_dir = output_dir / f"debug_maxrows_{max_rows}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    entries = manifest["entries"]
+    train_entries = [entry for entry in entries if entry["split"] == "train"]
+    if any(entry["attack_family"] != "normal" for entry in train_entries):
+        raise ValueError("Training ranges must contain benign normal traffic only")
+    train_frames = []
+    for entry in train_entries:
+        frame = pd.read_csv(root / entry["frame_path"], dtype={"CAN_ID": "string"})
+        train_frames.append(frame.iloc[:max_rows] if max_rows else frame)
+    if not train_frames:
+        raise ValueError("The split manifest contains no training range")
+
+    id_map = build_id_map(train_frames, cfg)
+    train_matrix = np.concatenate([_frame_matrix(frame, cfg, id_map) for frame in train_frames], axis=0)
+    train_mean, train_std = fit_scaler(train_matrix, cfg.scaler_epsilon)
+
+    with open(output_dir / "can_id_map.json", "w", encoding="utf-8") as handle:
+        json.dump({"mapping": id_map, "unknown_code": cfg.unknown_id_code}, handle, indent=2, sort_keys=True)
+    np.savez_compressed(
+        output_dir / "scaler.npz",
+        mean=train_mean,
+        std=train_std,
+        epsilon=np.float32(cfg.scaler_epsilon),
     )
 
-    # Normalize CAN_ID to lowercase hex without 0x
-    if cfg.id_col in df.columns:
-        df[cfg.id_col] = df[cfg.id_col].astype("string").str.lower().str.replace("0x", "", regex=False)
+    grouped: dict[str, list[dict[str, np.ndarray]]] = {"train": [], "val": [], "test": []}
+    for entry in entries:
+        frame = pd.read_csv(root / entry["frame_path"])
+        if max_rows is not None:
+            frame = frame.iloc[:max_rows].copy()
+        X = _frame_matrix(frame, cfg, id_map)
+        X = (X - train_mean) / train_std
+        arrays = build_window_arrays(
+            X,
+            frame["label"].to_numpy(dtype=np.int8),
+            frame,
+            cfg.window_len,
+            cfg.hop,
+        )
+        grouped[entry["split"]].append(arrays)
 
-    # Clip DLC to [0,8]
-    if cfg.dlc_col in df.columns:
-        df[cfg.dlc_col] = pd.to_numeric(df[cfg.dlc_col], errors="coerce").fillna(0).clip(0, 8).astype(np.int16)
+    def combine(split: str) -> dict[str, np.ndarray]:
+        parts = grouped[split]
+        if not parts:
+            raise ValueError(f"No ranges found for split {split!r}")
+        return {key: np.concatenate([part[key] for part in parts], axis=0) for key in parts[0]}
 
-    return df
+    train = combine("train")
+    val = combine("val")
+    test = combine("test")
+    _save_windows(output_dir / "train_windows.npz", train, include_labels=False)
+    _save_windows(output_dir / "val_windows.npz", val)
+    _save_windows(output_dir / "test_windows.npz", test)
 
-def _extract_payload_uint8(df: pd.DataFrame, cfg: Config) -> np.ndarray:
-    cols = []
-    for c in cfg.payload_cols:
-        cols.append(_hex_series_to_uint8(df[c]) if c in df.columns else np.zeros(len(df), dtype=np.uint8))
-    return np.stack(cols, axis=1)  # (N, 8)
-
-def _encode_can_id(df: pd.DataFrame, cfg: Config, id_to_code: dict[str, int] | None) -> np.ndarray:
-    if cfg.id_col not in df.columns:
-        return np.zeros(len(df), dtype=np.int32)
-
-    s = df[cfg.id_col].astype("string").fillna("").str.lower().str.replace("0x", "", regex=False)
-
-    if id_to_code is None:
-        # Fallback, but we should not use this in the final pipeline anymore
-        codes, _ = pd.factorize(s)
-        return codes.astype(np.int32)
-
-    # Map using the shared vocabulary; unknown IDs become -1
-    mapped = s.map(lambda x: id_to_code.get(str(x), -1)).to_numpy(dtype=np.int32, copy=False)
-    return mapped
-
-def _build_feature_matrix(df: pd.DataFrame, cfg: Config, id_to_code: dict[str, int] | None) -> np.ndarray:
-    p = _extract_payload_uint8(df, cfg).astype(np.float32)
-    dlc = (df[cfg.dlc_col].to_numpy(dtype=np.float32, copy=False).reshape(-1, 1)) if cfg.dlc_col in df.columns else np.zeros((len(df), 1), dtype=np.float32)
-    cid = _encode_can_id(df, cfg, id_to_code).astype(np.float32).reshape(-1, 1)
-    X = np.concatenate([p, dlc, cid], axis=1)
-    return X
-
-def _windows_torch(X_np: np.ndarray, win: int, hop: int, device: str) -> np.ndarray:
-    """
-    Slide along time axis producing (M, win, F)
-    X_np: (N, F)
-    """
-    N, F = X_np.shape
-    if N < win:
-        raise ValueError(f"not enough rows ({N}) for window_len={win}")
-
-    t = torch.from_numpy(X_np)  # (N, F)
-    if device == "cuda":
-        t = t.to("cuda", non_blocking=True)
-
-    # Unfold along N after transpose to (F, N)
-    u = t.transpose(0, 1).unfold(dimension=1, size=win, step=hop).contiguous()  # (F, M, win)
-    out = u.permute(1, 2, 0).contiguous()  # (M, win, F)
-    return out.detach().cpu().numpy()
-
-def _derive_window_labels(df: pd.DataFrame, win: int, hop: int) -> Optional[np.ndarray]:
-    if "label" not in df.columns:
-        return None
-    lab = pd.to_numeric(df["label"], errors="coerce").fillna(0).astype(int).to_numpy()
-    N = len(lab)
-    if N < win:
-        return None
-    M = 1 + max(0, (N - win) // hop)
-    y = np.zeros(M, dtype=np.int32)
-    start = 0
-    for i in range(M):
-        y[i] = int(np.any(lab[start:start + win] == 1))
-        start += hop
-    return y
-
-def _process_one(path: str, cfg: Config, max_rows: Optional[int], out_name: str, id_to_code: dict[str, int] | None) -> tuple[str, Optional[np.ndarray]]:
-    df = _read_can_csv(path, cfg, max_rows)
-    X = _build_feature_matrix(df, cfg, id_to_code)                          # (N, F)
-    W = _windows_torch(X, cfg.window_len, cfg.hop, cfg.device)              # (M, win, F)
-    y_win = _derive_window_labels(df, cfg.window_len, cfg.hop)
-
-    _ensure_outdir(cfg.out_dir)
-    out_path = os.path.join(cfg.out_dir, out_name)
-    if y_win is not None:
-        np.savez_compressed(out_path, X=W.astype(np.float32), y=y_win.astype(np.int32))
-    else:
-        np.savez_compressed(out_path, X=W.astype(np.float32))
-
-    print(f"Saved: {out_path}  windows={W.shape[0]}  win_len={W.shape[1]}  feat_dim={W.shape[2]}")
-    return out_path, y_win
-
-def _save_can_id_map(path: str, id_to_code: dict[str, int]) -> None:
-    with open(path, "w") as f:
-        json.dump(id_to_code, f, indent=2, sort_keys=True)
-
-def _load_can_id_map(path: str) -> dict[str, int]:
-    with open(path, "r") as f:
-        return json.load(f)
-
-def _build_can_id_map_from_train(df: pd.DataFrame, cfg: Config) -> dict[str, int]:
-    # Stable ordering: sort unique IDs so mapping is deterministic
-    ids = (
-        df[cfg.id_col]
-        .astype("string")
-        .fillna("")
-        .str.lower()
-        .str.replace("0x", "", regex=False)
-        .unique()
-    )
-    ids = sorted([x for x in ids if x is not None])
-    return {cid: i for i, cid in enumerate(ids)}
+    source_hashes = {entry["source_path"]: entry["source_sha256"] for entry in entries}
+    split_hashes = {
+        entry["frame_path"]: sha256_file(root / entry["frame_path"])
+        for entry in entries
+    }
+    meta = {
+        "pipeline_version": "corrected_dense_autoencoder_v1",
+        "feature_order": cfg.feature_order,
+        "window_len": cfg.window_len,
+        "hop": cfg.hop,
+        "normalization": cfg.normalize,
+        "scaler_epsilon": cfg.scaler_epsilon,
+        "unknown_id_code": cfg.unknown_id_code,
+        "id_map_filename": "can_id_map.json",
+        "scaler_filename": "scaler.npz",
+        "split_manifest_sha256": sha256_file(manifest_path),
+        "source_file_hashes": source_hashes,
+        "split_file_hashes": split_hashes,
+        "is_debug": max_rows is not None,
+        "debug_max_rows": max_rows,
+        "window_counts": {
+            "train": int(len(train["X"])),
+            "val": int(len(val["X"])),
+            "test": int(len(test["X"])),
+        },
+    }
+    with open(output_dir / "preprocess_meta.json", "w", encoding="utf-8") as handle:
+        json.dump(meta, handle, indent=2)
+    print(f"Saved processed windows under {output_dir}")
+    return output_dir
 
 
-# ---- Main -------------------------------------------------------------------
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max_rows", type=int, default=None, help="limit rows for quick debugging")
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--max-rows", type=int, default=None)
+    parser.add_argument("--out-dir", type=Path, default=None)
     args = parser.parse_args()
-
-    cfg = Config()
-    print(f"Device: {cfg.device}")
-
-    # Train: read once, build ID map, save it
-    df_train = _read_can_csv(cfg.train_csv, cfg, args.max_rows)
-    id_map = _build_can_id_map_from_train(df_train, cfg)
-    _ensure_outdir(cfg.out_dir)
-    id_map_path = os.path.join(cfg.out_dir, "can_id_map.json")
-    _save_can_id_map(id_map_path, id_map)
-    print(f"Saved: {id_map_path}  num_ids={len(id_map)}")
-
-    # Process train using the map
-    X_train = _build_feature_matrix(df_train, cfg, id_map)
-    W_train = _windows_torch(X_train, cfg.window_len, cfg.hop, cfg.device)
-    out_train = os.path.join(cfg.out_dir, "train_windows.npz")
-    np.savez_compressed(out_train, X=W_train.astype(np.float32))
-    print(f"Saved: {out_train}  windows={W_train.shape[0]}  win_len={W_train.shape[1]}  feat_dim={W_train.shape[2]}")
-
-    # Val/test: load the map and apply consistently
-    id_map = _load_can_id_map(id_map_path)
-    _process_one(cfg.val_csv, cfg, args.max_rows, "val_windows.npz", id_map)
-    _process_one(cfg.test_csv, cfg, args.max_rows, "test_windows.npz", id_map)
+    cfg = Config.from_json(args.config) if args.config else Config()
+    process(cfg, max_rows=args.max_rows, out_dir=args.out_dir)
 
 
 if __name__ == "__main__":

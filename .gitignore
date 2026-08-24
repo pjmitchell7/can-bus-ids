@@ -1,24 +1,27 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
 
-# Data and artifacts
-data/
-*.npz
-*.csv
-*.pt
-*.pth
+# Local data and processed artifacts
+data/raw/*
+data/interim/*
+data/processed/*
+!data/README.md
 
 # Experiment outputs
 experiments/run_*/
+*.npz
+*.pt
+*.pth
 
-# Environment
+# Environments and local settings
 .env
-.venv
+.venv/
 env/
 conda-env/
+config.json
 
 # OS / editor
 .DS_Store
 .vscode/
-
