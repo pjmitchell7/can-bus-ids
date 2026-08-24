@@ -1,159 +1,71 @@
-# CAN Bus Intrusion Detection using Deep Learning
+# CAN Bus intrusion detection baseline
 
-This repository contains my final project for **CSCI 680 – Autonomous Driving & Connected Mobility** at the College of William & Mary.
+This repository contains a corrected, reproducible rerun of the existing benign-only dense autoencoder baseline for the OCSLab/HCRL Car Hacking Dataset. It is intentionally not the later sequence-model or ablation research project.
 
-The goal of this project is to explore whether deep learning models can detect malicious activity on a vehicle’s **Controller Area Network (CAN) bus** under realistic constraints. Instead of relying on fixed rules or known attack signatures, the system learns what *normal* CAN traffic looks like and flags deviations as anomalies.
+## Data placement
 
-The current implementation focuses on an **unsupervised autoencoder baseline**, with an emphasis on correctness, interpretability, and real-time feasibility rather than chasing benchmark numbers.
+The dataset is not committed. Put these files in `data/raw/`:
 
----
+- `train_normal.csv` with a header
+- `DoS_dataset.csv`
+- `Fuzzy_dataset.csv`
+- `gear_dataset.csv`
+- `RPM_dataset.csv`
 
-## Project Overview
+The attack captures are headerless HCRL CSV files with Timestamp, CAN ID, DLC, up to eight payload bytes, and a Flag column. The converter in tools/convert_txt_to_csv.py accepts text-log input and explicit --input/--output paths.
 
-Modern vehicles rely on dozens of Electronic Control Units (ECUs) that communicate over the CAN bus. While CAN is efficient and reliable, it lacks authentication and encryption, meaning any compromised node can inject messages that appear legitimate.
+## Pipeline
 
-This project builds an intrusion detection system (IDS) that:
-- Learns normal CAN communication patterns from benign data
-- Detects anomalous behavior using reconstruction error
-- Operates fast enough to meet real-time constraints
-- Avoids reliance on labeled attack data during training
+Each frame has ten model features: DATA0 through DATA7, DLC, and a stable numeric CAN-ID code. Flag == T means injected and Flag == R means normal, including normal frames that occur in an attack capture.
 
-The system is evaluated using the **Car Hacking Dataset**, which includes both obvious attacks (e.g., flooding) and subtle spoofing attacks (e.g., RPM and Gear manipulation).
+The normal capture is kept in chronological order and split into three contiguous, non-overlapping ranges before windowing. The split ratio is deliberately not chosen in code; set normal_split_ratio in a copied config.json after approving the policy. Each attack capture is split contiguously into validation and test halves and remains separate until after windowing.
 
----
+Preprocessing fits the sorted CAN-ID map and feature-wise z-score statistics on benign training frames only. Constant or near-constant features use a standard deviation of 1.0. The frozen artifacts are saved as can_id_map.json, scaler.npz, and preprocess_meta.json.
 
-## Repository Structure
-CAN_Bus_Security/
-│
-├── src/
-│ ├── preprocess.py # CAN log parsing, normalization, windowing
-│ ├── evaluate.py # Reconstruction error, thresholding, metrics
-│ └── model.py # Autoencoder definition and training logic
-│
-├── tools/
-│ └── add_window_labels.py # Aligns per-message labels to window labels
-│
-├── experiments/
-│ └── run_*/ # Saved experiment configs and results
-│
-├── data/ # (Ignored) Raw and processed CAN data
-│
-└── README.md
+Windows contain 64 consecutive frames with hop 32. A window is positive if any frame in that same window has label 1. Window metadata records capture ID, attack family, source start row, and source end row. No window crosses a capture or split boundary.
 
-The `data/` directory is intentionally not included in the repository due to dataset size and licensing. See below for dataset details.
+The model remains the original fully connected autoencoder:
 
----
+`640 -> 128 -> 64 -> 32 -> 64 -> 128 -> 640`
 
-## Dataset
+It uses ReLU hidden layers, a linear output layer, dropout 0.10, Adam, learning rate 1e-3, weight decay 1e-5, batch size 256, 30 epochs, and MSE loss.
 
-This project uses the **Car Hacking Dataset** from OCSLab:
+## Reproduction commands
 
-https://ocslab.hksecurity.net/Datasets/car-hacking-dataset
+Install dependencies:
 
-The dataset contains:
-- One benign CAN traffic log
-- Four attack types:
-  - Denial of Service (DoS)
-  - Fuzzy injection
-  - Gear spoofing
-  - RPM spoofing
+```
+python -m pip install -r requirements.txt
+```
 
-Training is performed using **benign traffic only**, consistent with an unsupervised anomaly detection setup. Attack data is used strictly for validation and testing.
+Copy config.example.json to config.json, then set the approved normal split ratio. Run:
 
----
+```
+python -m pytest -q
+python -m src.make_splits --config config.json
+python -m src.preprocess --config config.json
+python -m src.train --config config.json
+python -m src.evaluate --run experiments/run_corrected_<timestamp> --threshold-method train_percentile
+python -m src.evaluate --run experiments/run_corrected_<timestamp> --threshold-method val_f1
+```
 
-## Preprocessing Pipeline
+Use --max-rows for debug runs. Debug preprocessing is written below a debug_maxrows_<n> directory and is marked in metadata; it must not be used as final evidence.
 
-Raw CAN logs are converted into model-ready inputs through the following steps:
+## Evaluation
 
-1. **Feature extraction**
-   - 8 payload bytes
-   - DLC (Data Length Code)
-   - Encoded CAN ID
+The two retained comparisons are:
 
-2. **Normalization**
-   - Z-score normalization using statistics from benign training data only
-   - Prevents byte values from dominating reconstruction loss
+1. train_percentile, using the configured 99th percentile of benign training reconstruction errors.
+2. val_f1, a labeled diagnostic that selects on validation and freezes the threshold for test.
 
-3. **Windowing**
-   - 64 CAN frames per window
-   - Stride of 32 (50% overlap)
-   - Each window represents ~100 ms of CAN activity
+The optional f1_capped method remains available as a clearly named diagnostic. Each method writes its own metrics_<method>.json and aligned scores_<method>_val.npz/scores_<method>_test.npz.
 
-4. **Label alignment**
-   - A window is labeled anomalous if *any* message inside the window is malicious
-   - This reflects realistic safety requirements
+Metrics include TP, FP, TN, FN, positive and negative counts, prevalence, accuracy, specificity, false-positive rate, precision, recall, F1, flagged-window rate, AUPRC, optional AUROC, and per-family results. A family subset with no standalone negatives reports positive-window recall and does not invent precision or false-positive metrics.
 
-Earlier versions of the pipeline suffered from window-label misalignment, which produced unrealistically high metrics. These issues were corrected, and all reported results reflect properly aligned evaluation.
+Latency is a repeated forward-pass measurement with CUDA synchronization around each timed call. It reports median, p95, batch size, input shape, device, and dtype. It is not an end-to-end or embedded-deployment latency claim.
 
----
+## Current evidence and limitations
 
-## Model
+Historical numbers from the prior report are context only and are not reproduced here. No corrected full-data numbers should be added until a saved run has been completed with the real raw files and the approved normal split ratio.
 
-The baseline model is a **fully connected autoencoder** trained only on benign CAN windows.
-
-Key properties:
-- Input dimension: 640 (64 frames × 10 features)
-- Bottleneck forces compression of normal behavior
-- Mean squared error used as reconstruction loss
-- No attack data seen during training
-
-The model does not attempt to classify attack types. Instead, it flags windows that do not conform to learned normal patterns.
-
----
-
-## Detection and Thresholding
-
-Reconstruction error serves as the anomaly score.
-
-Two thresholding strategies are explored:
-- **Training percentile threshold** (deployment-oriented, high precision)
-- **Validation F1-optimized threshold** (diagnostic only)
-
-Percentile-based thresholds are used to avoid reliance on absolute error values and to improve robustness across environments.
-
----
-
-## Results Summary
-
-Key findings:
-- Precision is consistently near perfect (>99%)
-- Recall is moderate, especially for subtle spoofing attacks
-- Inference latency is sub-millisecond on GPU
-- Threshold choice strongly affects alert rate
-
-The model reliably detects obvious attacks but struggles with stealthy attacks that closely mimic normal behavior. This is an expected limitation of static-window reconstruction models and motivates future sequence-aware approaches.
-
----
-
-## Limitations and Future Work
-
-This project intentionally focuses on a simple, interpretable baseline. Identified limitations include:
-- Lack of explicit temporal modeling
-- Payload byte dominance in reconstruction loss
-- Sensitivity to threshold selection
-- Limited dataset diversity
-
-Future directions include:
-- LSTM or Transformer-based sequence models
-- Feature reweighting to emphasize message identity and timing
-- Training on CAN logs from multiple vehicles and environments
-- Hybrid systems combining anomaly detection with lightweight rules
-
----
-
-## Reproducibility Notes
-
-- All preprocessing statistics are computed from training data only
-- CAN ID mappings are saved and reused across splits
-- Evaluation uses window-level labels derived from message-level annotations
-- Results reported in the paper and slides correspond to committed code
-
----
-
-## Author
-
-**Paul J. Mitchell**  
-M.S. Computer Science  
-College of William & Mary  
-pjmitchell@wm.edu
+The baseline uses static overlapping windows and a single vehicle capture. It does not add timing features, ID embeddings, sequence models, alert episodes, detection delay, cross-vehicle evaluation, or other later research experiments.
