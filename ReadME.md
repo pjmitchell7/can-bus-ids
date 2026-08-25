@@ -73,6 +73,6 @@ Latency is a repeated forward-pass measurement with CUDA synchronization around 
 
 ## Current evidence and limitations
 
-Historical numbers from the prior report are context only and are not reproduced here. No corrected full-data numbers should be added until a saved run has been completed with the real raw files and the approved normal split ratio.
+Historical numbers from prior reports are context only. A corrected full-data run has been completed with the verified raw files and approved split policy; its metrics, checkpoint, and generated artifacts are kept outside Git as a separate evidence bundle.
 
 The baseline uses static overlapping windows and a single vehicle capture. It does not add timing features, ID embeddings, sequence models, alert episodes, detection delay, cross-vehicle evaluation, or other later research experiments.

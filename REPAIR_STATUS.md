@@ -1,47 +1,26 @@
-# Baseline repair status
+# Project status
 
-## Current phase
+## Current state
 
-Phase 6: official raw data verified, chronological split completed, and bounded preprocessing validation passed. HPC execution remains pending account access and is not claimed here.
+The corrected dense-autoencoder baseline is complete and is maintained on `fix/baseline-pipeline` at commit `df99b495cba3721910e344e2efd92bfb9854fd21`.
 
-## Starting point
-
-- Audited commit: `9956ad12ec61d44aaefdef8e907776b7086120cd`
-- Repair branch: `fix/baseline-pipeline`
-- Starting working tree: clean
-- Raw dataset files: official HCRL captures are present under `data/raw/` and are ignored by Git
-- Dataset evidence: `data/dataset_verification.json` records names, sizes, row counts, SHA-256 hashes, widths, timestamps, and flags
-- Tracked `data` entries: stale symlink targets to `/scratch/pjmitchell/CAN_Bus_Security/data` were not used
-
-## Audit checklist
-
-- [x] Attack rows are labeled `1` by filename instead of by `Flag`.
-- [x] Normal validation and test rows overlap the training capture.
-- [x] The central z-score setting is not implemented by preprocessing.
-- [x] Raw captures are concatenated and timestamp-sorted before windowing.
-- [x] Attack-family metadata is not preserved.
-- [x] The CSV label fallback assumes non-overlapping windows.
-- [x] Threshold configuration names disagree between config and evaluator.
-- [x] Evaluation omits confusion counts, prevalence, FPR, AUPRC, and useful family detail.
-- [x] CUDA timing is not synchronized or repeated.
-- [x] Reproducibility, paths, dependencies, tests, and README structure are incomplete.
+- The official HCRL captures were verified under `data/raw/`.
+- The normal capture uses a chronological 60/20/20 train/validation/test split.
+- Each attack capture uses a chronological 50/50 validation/test split.
+- Windows contain 64 frames with hop 32 and never cross capture or split boundaries.
+- The full run completed on a GPU with 30 training epochs, both threshold methods, and synchronized latency measurements.
 
 ## Verification
 
-- 13 parser and synthetic regression tests pass.
-- The full raw data produces 11 independent chronological ranges using normal 60/20/20 and attack 50/50 splits.
-- A bounded 2,000-row-per-range preprocessing run produced 64-frame, hop-32 capture-safe windows and train-only preprocessing artifacts.
-- No corrected full-data metrics exist yet.
+- The parser and regression suite passes all 13 tests.
+- The raw-data verification report records file names, sizes, row counts, SHA-256 hashes, row widths, timestamps, and T/R flag counts.
+- Preprocessing fits the CAN-ID map and z-score statistics on benign training frames only.
+- The run metadata records seed 42, ten input features, the preserved dense-autoencoder architecture, and the CUDA device.
 
-## Remaining work
+## Data and outputs
 
-- [x] Approve and set the normal train/validation/test ratio to 60/20/20.
-- [x] Place and verify the five official raw dataset files under `data/raw/`.
-- [x] Build chronological split files and manifest without shuffling or cross-boundary ranges.
-- [x] Validate parser behavior locally, including DLC-dependent attack rows and T/R semantics.
-- [ ] Run full corrected preprocessing, dense-autoencoder training, both threshold modes, and the repeated latency probe.
-- [ ] Run the prepared HPC workflow after account access and data transfer are available.
+Raw captures, local configuration, model checkpoints, score arrays, and generated metrics are intentionally excluded from Git. Keep the run directory as a separate evidence bundle when reproducing the experiment.
 
-## Pending approval
+## Scope
 
-The local `config.json` uses the user-approved 60/20/20 normal split, 50/50 attack validation/test split, 64-frame windows, hop 32, and CPU. The full training/evaluation run is intentionally not reported because the local Torch package is incomplete and HPC access is not yet available.
+This project is the corrected benign-only dense-autoencoder baseline. It does not include timing features, ID embeddings, sequence models, alert episodes, detection delay, cross-vehicle evaluation, or later research experiments.

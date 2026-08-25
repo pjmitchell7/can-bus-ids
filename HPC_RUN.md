@@ -1,20 +1,21 @@
-# HPC run preparation
+# HPC reproduction guide
 
-This is a prepared workflow only. It has not been executed, and this repository records no HPC results.
+This guide documents the reproducible HPC workflow for the corrected dense-autoencoder baseline. A full run has been completed with the verified HCRL captures; raw data, checkpoints, and generated metrics remain outside version control.
 
 ## Connect and allocate
 
-After W&M account access is available:
+Use the SSH alias and project paths configured for your HPC account:
 
 ```bash
-ssh -J pjmitchell@bastion.wm.edu pjmitchell@gulf.sciclone.wm.edu
-cd ~/can-bus-ids
+ssh <hpc-alias>
+cd /sciclone/scr20/<account>/can-bus-ids
+module load slurm/23.11.6
 salloc -N1 -n8 -t 1-0 --gpus=1
 hostname
 nvidia-smi
 ```
 
-The repository and the five verified raw files must be present on the allocated node or its shared filesystem. Transfer the repository without `data/raw/`, local `config.json`, archives, or generated outputs; transfer the verified raw files separately into `data/raw/`.
+The repository and the five verified raw files must be present on the allocated node or its shared filesystem. Keep raw files, archives, credentials, local configuration, and generated outputs out of Git.
 
 ## Run sequence
 
@@ -29,7 +30,7 @@ python -m src.evaluate --run experiments/run_corrected_<timestamp> --threshold-m
 python -m src.evaluate --run experiments/run_corrected_<timestamp> --threshold-method val_f1
 ```
 
-Copy `config.hpc.example.json` to the local `config.json` on the cluster. It sets `device` to `cuda` and preserves the approved split, feature order, 64-frame window, hop 32, dense-autoencoder architecture, and training settings. Keep the generated run directory and metrics as the evidence bundle. Do not commit raw data, archives, credentials, `config.json`, or large generated artifacts.
+Copy `config.hpc.example.json` to `config.json` on the cluster. It sets `device` to `cuda` and preserves the approved split, feature order, 64-frame window, hop 32, dense-autoencoder architecture, and training settings. Keep the generated run directory and metrics as the evidence bundle; do not commit raw data, archives, credentials, `config.json`, or large generated artifacts.
 
 ## Required checks before reporting results
 

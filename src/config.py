@@ -38,7 +38,7 @@ class Config:
         "DATA4", "DATA5", "DATA6", "DATA7",
     )
 
-    # This is intentionally unset until the owner approves the split policy.
+    # Leave this unset by default so full-data runs must specify a split policy.
     normal_split_ratio: tuple[float, float, float] | None = None
     attack_val_fraction: float = 0.5
 
